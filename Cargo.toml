@@ -1,0 +1,60 @@
+[package]
+name = "collect-pubkey"
+version = "0.1.0"
+edition = "2021"
+description = "Bitcoin on-chain public key collector with CPU/GPU storage formats"
+authors = ["Bitcoin Pubkey Collector"]
+
+[[bin]]
+name = "collect-pubkey"
+path = "src/main.rs"
+
+[lib]
+name = "collect_pubkey"
+path = "src/lib.rs"
+
+[dependencies]
+# Bitcoin parsing and crypto
+bitcoin = { version = "0.32", features = ["serde"] }
+secp256k1 = { version = "0.29", features = ["serde"] }
+
+# Storage
+rocksdb = "0.22"
+
+# Hashing
+sha2 = "0.10"
+ripemd = "0.1"
+
+# Memory mapping and IO
+memmap2 = "0.9"
+byteorder = "1.5"
+
+# Parallelism
+rayon = "1.10"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and progress
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.16"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
