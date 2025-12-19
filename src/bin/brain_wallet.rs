@@ -74,6 +74,10 @@ enum Commands {
         /// Electrs server address for balance queries (e.g., 192.168.1.19:50001)
         #[arg(long)]
         electrs: Option<String>,
+
+        /// Output file for matches with balance (only used with --electrs)
+        #[arg(long, default_value = "matches_with_balance.txt")]
+        balance_output: PathBuf,
     },
 
     /// Generate passphrases from a text file (split by sentences, phrases, etc.)
@@ -596,6 +600,7 @@ fn run_scan(
     skip_bloom: bool,
     with_variations: bool,
     electrs_addr: Option<String>,
+    balance_output_path: PathBuf,
 ) -> Result<()> {
     // Set thread count
     if let Some(t) = threads {
@@ -762,13 +767,25 @@ fn run_scan(
     log::info!("Time elapsed: {:?}", elapsed);
     log::info!("Rate: {:.2} passphrases/sec", rate);
 
-    // Count matches with balance
+    // Count matches with balance and write to separate file
     if electrum_client.is_some() {
-        let with_balance = final_results.iter().filter(|r| r.has_balance()).count();
-        log::info!("Matches with balance: {}", with_balance);
+        let matches_with_balance: Vec<_> = final_results.iter().filter(|r| r.has_balance()).collect();
+        log::info!("Matches with balance: {}", matches_with_balance.len());
+
+        // Write matches with balance to separate file
+        if !matches_with_balance.is_empty() {
+            let file = File::create(&balance_output_path)?;
+            let mut writer = BufWriter::new(file);
+
+            for result in matches_with_balance.iter() {
+                writeln!(writer, "{}", result.format())?;
+            }
+
+            log::info!("🎉 Matches with balance written to {:?}", balance_output_path);
+        }
     }
 
-    // Write results to file
+    // Write all results to file
     if !final_results.is_empty() {
         let file = File::create(&output_path)?;
         let mut writer = BufWriter::new(file);
@@ -777,7 +794,7 @@ fn run_scan(
             writeln!(writer, "{}", result.format())?;
         }
 
-        log::info!("Results written to {:?}", output_path);
+        log::info!("All results written to {:?}", output_path);
     }
 
     Ok(())
@@ -977,8 +994,9 @@ fn main() -> Result<()> {
             skip_bloom,
             with_variations,
             electrs,
+            balance_output,
         } => {
-            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs)?;
+            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output)?;
         }
         Commands::Generate {
             input,

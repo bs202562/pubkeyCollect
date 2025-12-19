@@ -61,6 +61,11 @@ brain-wallet scan -i wordlists/common_passphrases.txt -i wordlists/bible_sample.
 brain-wallet scan -i wordlists/common_passphrases.txt --electrs 192.168.1.19:50001
 ```
 
+有余额的结果会自动保存到 `matches_with_balance.txt`，也可自定义：
+```bash
+brain-wallet scan -i wordlists/common_passphrases.txt --electrs 192.168.1.19:50001 --balance-output found_balance.txt
+```
+
 参数说明：
 - `-i, --input`: 输入文件（每行一个密码短语）
 - `-d, --data-dir`: 公钥数据库目录（默认 `output`）
@@ -69,6 +74,7 @@ brain-wallet scan -i wordlists/common_passphrases.txt --electrs 192.168.1.19:500
 - `--skip-bloom`: 跳过 Bloom Filter（更快加载，适合小批量测试）
 - `--with-variations`: 生成密码短语变体（大小写、添加后缀等）
 - `--electrs`: Electrs 服务器地址（例如 `192.168.1.19:50001`），用于查询余额
+- `--balance-output`: 有余额的匹配结果单独保存文件（默认 `matches_with_balance.txt`）
 
 ### 3. 从文本生成密码短语
 
