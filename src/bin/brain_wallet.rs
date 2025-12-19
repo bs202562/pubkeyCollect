@@ -213,30 +213,22 @@ impl ElectrumClient {
         hex::encode(reversed)
     }
 
-    /// Query balance for a scripthash
-    async fn get_balance(&self, scripthash: &str) -> Result<BalanceInfo> {
+    /// Connect to electrs and return reader/writer
+    async fn connect(&self) -> Result<(
+        tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    )> {
         let stream = TcpStream::connect(&self.addr)
             .await
             .with_context(|| format!("Failed to connect to electrs at {}", self.addr))?;
 
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = TokioBufReader::new(reader);
+        let (reader, writer) = stream.into_split();
+        Ok((TokioBufReader::new(reader), writer))
+    }
 
-        // Send JSON-RPC request
-        let request = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.get_balance","params":["{}"]}}"#,
-            scripthash
-        );
-        writer.write_all(request.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-
-        // Read response
-        let mut response = String::new();
-        reader.read_line(&mut response).await?;
-
-        // Parse JSON response
-        let json: serde_json::Value = serde_json::from_str(&response)
+    /// Parse a balance response from JSON
+    fn parse_balance_response(response: &str) -> Result<BalanceInfo> {
+        let json: serde_json::Value = serde_json::from_str(response)
             .with_context(|| format!("Failed to parse electrs response: {}", response))?;
 
         if let Some(error) = json.get("error") {
@@ -255,33 +247,89 @@ impl ElectrumClient {
         })
     }
 
-    /// Query all balances for a hash160 (P2PKH, P2WPKH, P2SH-P2WPKH)
+    /// Query all balances for a hash160 using a single connection
     async fn get_all_balances(&self, hash160: &[u8; 20]) -> AllBalances {
         let mut result = AllBalances::default();
 
-        // P2PKH
-        let scripthash = Self::scripthash_p2pkh(hash160);
-        match self.get_balance(&scripthash).await {
-            Ok(balance) => result.p2pkh = Some(balance),
-            Err(e) => log::warn!("Failed to query P2PKH balance: {}", e),
+        // Try to connect with retry
+        let connection = {
+            let mut attempts = 0;
+            loop {
+                match self.connect().await {
+                    Ok(conn) => break Some(conn),
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 3 {
+                            log::warn!("Failed to connect after 3 attempts: {}", e);
+                            break None;
+                        }
+                        // Wait before retry
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        };
+
+        let Some((mut reader, mut writer)) = connection else {
+            return result;
+        };
+
+        // Prepare all scripthashes
+        let scripthash_p2pkh = Self::scripthash_p2pkh(hash160);
+        let scripthash_p2wpkh = Self::scripthash_p2wpkh(hash160);
+        let scripthash_p2sh_p2wpkh = Self::scripthash_p2sh_p2wpkh(hash160);
+
+        // Send all 3 requests in batch (JSON-RPC allows pipelining)
+        let requests = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.get_balance","params":["{}"]}}
+{{"jsonrpc":"2.0","id":2,"method":"blockchain.scripthash.get_balance","params":["{}"]}}
+{{"jsonrpc":"2.0","id":3,"method":"blockchain.scripthash.get_balance","params":["{}"]}}
+"#,
+            scripthash_p2pkh, scripthash_p2wpkh, scripthash_p2sh_p2wpkh
+        );
+
+        if let Err(e) = writer.write_all(requests.as_bytes()).await {
+            log::warn!("Failed to send requests: {}", e);
+            return result;
+        }
+        if let Err(e) = writer.flush().await {
+            log::warn!("Failed to flush: {}", e);
+            return result;
         }
 
-        // P2WPKH
-        let scripthash = Self::scripthash_p2wpkh(hash160);
-        match self.get_balance(&scripthash).await {
-            Ok(balance) => result.p2wpkh = Some(balance),
-            Err(e) => log::warn!("Failed to query P2WPKH balance: {}", e),
+        // Read 3 responses
+        let mut response = String::new();
+
+        // Response 1: P2PKH
+        response.clear();
+        if reader.read_line(&mut response).await.is_ok() {
+            match Self::parse_balance_response(&response) {
+                Ok(balance) => result.p2pkh = Some(balance),
+                Err(e) => log::warn!("Failed to parse P2PKH response: {}", e),
+            }
         }
 
-        // P2SH-P2WPKH
-        let scripthash = Self::scripthash_p2sh_p2wpkh(hash160);
-        match self.get_balance(&scripthash).await {
-            Ok(balance) => result.p2sh_p2wpkh = Some(balance),
-            Err(e) => log::warn!("Failed to query P2SH-P2WPKH balance: {}", e),
+        // Response 2: P2WPKH
+        response.clear();
+        if reader.read_line(&mut response).await.is_ok() {
+            match Self::parse_balance_response(&response) {
+                Ok(balance) => result.p2wpkh = Some(balance),
+                Err(e) => log::warn!("Failed to parse P2WPKH response: {}", e),
+            }
+        }
+
+        // Response 3: P2SH-P2WPKH
+        response.clear();
+        if reader.read_line(&mut response).await.is_ok() {
+            match Self::parse_balance_response(&response) {
+                Ok(balance) => result.p2sh_p2wpkh = Some(balance),
+                Err(e) => log::warn!("Failed to parse P2SH-P2WPKH response: {}", e),
+            }
         }
 
         result
     }
+
 }
 
 /// All balances for different address types
@@ -732,16 +780,46 @@ fn run_scan(
 
             // Create tokio runtime for async queries
             let rt = tokio::runtime::Runtime::new()?;
-            let mut results_with_balances = Vec::new();
 
-            for mut match_result in pending {
-                let balances = rt.block_on(client.get_all_balances(&match_result.hash160));
-                match_result.balances = Some(balances);
+            // Extract all hash160s for batch query
+            let hash160s: Vec<[u8; 20]> = pending.iter().map(|m| m.hash160).collect();
+
+            // Progress bar for balance queries
+            let balance_progress = ProgressBar::new(hash160s.len() as u64);
+            balance_progress.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} querying balances...")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+
+            // Query balances in batch with progress updates
+            let balances = rt.block_on(async {
+                let mut results = Vec::with_capacity(hash160s.len());
+
+                for (i, hash160) in hash160s.iter().enumerate() {
+                    let balance = client.get_all_balances(hash160).await;
+                    results.push(balance);
+                    balance_progress.inc(1);
+
+                    // Add small delay every 10 queries to avoid overwhelming the server
+                    if (i + 1) % 10 == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                }
+
+                results
+            });
+
+            balance_progress.finish();
+
+            // Combine results
+            let mut results_with_balances = Vec::new();
+            for (mut match_result, balance) in pending.into_iter().zip(balances.into_iter()) {
+                match_result.balances = Some(balance);
 
                 if match_result.has_balance() {
                     eprintln!("\n🎉 MATCH WITH BALANCE:\n{}", match_result.format());
-                } else {
-                    eprintln!("\nMatch balance queried:\n{}", match_result.format());
                 }
 
                 results_with_balances.push(match_result);
