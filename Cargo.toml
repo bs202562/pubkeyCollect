@@ -9,6 +9,10 @@ authors = ["Bitcoin Pubkey Collector"]
 name = "collect-pubkey"
 path = "src/main.rs"
 
+[[bin]]
+name = "brain-wallet"
+path = "src/bin/brain_wallet.rs"
+
 [lib]
 name = "collect_pubkey"
 path = "src/lib.rs"
@@ -50,6 +54,10 @@ anyhow = "1.0"
 
 # Utilities
 hex = "0.4"
+bs58 = "0.5"
+
+# Networking (for Electrum protocol)
+tokio = { version = "1.0", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3.16"
