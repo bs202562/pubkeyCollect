@@ -3,4 +3,5 @@
 pub mod cpu_index;
 pub mod bloom;
 pub mod fp64;
+pub mod known_brainwallets;
 

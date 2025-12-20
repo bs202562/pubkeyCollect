@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use collect_pubkey::storage::bloom::BloomFilter;
 use collect_pubkey::storage::cpu_index::{CpuIndex, PubkeyRecord};
 use collect_pubkey::storage::fp64::Fp64Table;
+use collect_pubkey::storage::known_brainwallets::KnownBrainWalletsDb;
 use indicatif::{ProgressBar, ProgressStyle};
 use ripemd::Ripemd160;
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
@@ -28,7 +29,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use rayon::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
@@ -78,6 +79,14 @@ enum Commands {
         /// Output file for matches with balance (only used with --electrs)
         #[arg(long, default_value = "matches_with_balance.txt")]
         balance_output: PathBuf,
+
+        /// Path to known brain wallets database (skip known records, auto-add new ones)
+        #[arg(long, default_value = "known_brainwallets.jsonl")]
+        known_db: PathBuf,
+
+        /// Disable known brain wallets tracking
+        #[arg(long)]
+        no_known_db: bool,
     },
 
     /// Generate passphrases from a text file (split by sentences, phrases, etc.)
@@ -119,6 +128,54 @@ enum Commands {
         /// Electrs server address for balance queries (e.g., 192.168.1.19:50001)
         #[arg(long)]
         electrs: Option<String>,
+    },
+
+    /// Import records from matches.txt into the known brain wallets database
+    Import {
+        /// Input file (matches.txt format)
+        #[arg(short, long, default_value = "matches.txt")]
+        input: PathBuf,
+
+        /// Path to the known brain wallets database
+        #[arg(short, long, default_value = "known_brainwallets.jsonl")]
+        database: PathBuf,
+    },
+
+    /// List all known brain wallets
+    List {
+        /// Path to the known brain wallets database
+        #[arg(short, long, default_value = "known_brainwallets.jsonl")]
+        database: PathBuf,
+
+        /// Output format: table, json, csv
+        #[arg(short, long, default_value = "table")]
+        format: String,
+
+        /// Maximum number of records to show (0 = all)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Show statistics about the known brain wallets database
+    Stats {
+        /// Path to the known brain wallets database
+        #[arg(short, long, default_value = "known_brainwallets.jsonl")]
+        database: PathBuf,
+    },
+
+    /// Export known brain wallets to a file
+    Export {
+        /// Path to the known brain wallets database
+        #[arg(short, long, default_value = "known_brainwallets.jsonl")]
+        database: PathBuf,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Output format: json, csv, txt
+        #[arg(short, long, default_value = "txt")]
+        format: String,
     },
 }
 
@@ -263,8 +320,8 @@ impl ElectrumClient {
                             log::warn!("Failed to connect after 3 attempts: {}", e);
                             break None;
                         }
-                        // Wait before retry
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        // Wait before retry (short delay)
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
                 }
             }
@@ -649,6 +706,8 @@ fn run_scan(
     with_variations: bool,
     electrs_addr: Option<String>,
     balance_output_path: PathBuf,
+    known_db_path: PathBuf,
+    no_known_db: bool,
 ) -> Result<()> {
     // Set thread count
     if let Some(t) = threads {
@@ -657,6 +716,17 @@ fn run_scan(
             .build_global()
             .ok();
     }
+
+    // Load known brain wallets database
+    let known_db = if !no_known_db {
+        log::info!("Loading known brain wallets database from {:?}...", known_db_path);
+        let db = KnownBrainWalletsDb::open(&known_db_path)?;
+        log::info!("Loaded {} known brain wallet records", db.len());
+        Some(Arc::new(RwLock::new(db)))
+    } else {
+        log::info!("Known brain wallets tracking disabled");
+        None
+    };
 
     // Load scanner
     let scanner = Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?);
@@ -706,6 +776,8 @@ fn run_scan(
     let bloom_hits = AtomicU64::new(0);
     let fp64_hits = AtomicU64::new(0);
     let matches_found = AtomicU64::new(0);
+    let known_skipped = AtomicU64::new(0);
+    let new_matches = AtomicU64::new(0);
 
     // Electrs client (if configured)
     let electrum_client = electrs_addr.as_ref().map(|addr| {
@@ -725,6 +797,15 @@ fn run_scan(
         // Derive brain wallet
         match derive_brain_wallet(passphrase) {
             Ok((privkey, pubkey, hash160, addresses)) => {
+                // Check if this is a known brain wallet (skip if already in database)
+                if let Some(ref known_db) = known_db {
+                    if known_db.read().unwrap().contains_bytes(&hash160) {
+                        known_skipped.fetch_add(1, Ordering::Relaxed);
+                        progress.inc(1);
+                        return;
+                    }
+                }
+
                 let (bloom_hit, fp64_hit, record) = scanner.check(&hash160);
 
                 checked.fetch_add(1, Ordering::Relaxed);
@@ -746,10 +827,33 @@ fn run_scan(
                         private_key: privkey,
                         public_key: pubkey,
                         hash160,
-                        addresses,
-                        record,
+                        addresses: addresses.clone(),
+                        record: record.clone(),
                         balances: None, // Will be filled later if electrs is configured
                     };
+
+                    // Add to known brain wallets database
+                    if let Some(ref known_db) = known_db {
+                        let known_record = KnownBrainWalletsDb::create_record(
+                            passphrase.clone(),
+                            hex::encode(privkey),
+                            private_key_to_wif(&privkey),
+                            hex::encode(pubkey),
+                            hex::encode(hash160),
+                            addresses.p2pkh.clone(),
+                            addresses.p2wpkh.clone(),
+                            addresses.p2sh_p2wpkh.clone(),
+                            record.first_seen_height,
+                            format!("{:?}", record.pubkey_type),
+                        );
+                        
+                        if let Ok(mut db) = known_db.write() {
+                            if let Ok(true) = db.append_record(known_record) {
+                                new_matches.fetch_add(1, Ordering::Relaxed);
+                                log::debug!("Added new brain wallet to database: {}", hex::encode(hash160));
+                            }
+                        }
+                    }
 
                     // Print immediately (without balance for now)
                     eprintln!("\n{}", result.format());
@@ -797,15 +901,10 @@ fn run_scan(
             let balances = rt.block_on(async {
                 let mut results = Vec::with_capacity(hash160s.len());
 
-                for (i, hash160) in hash160s.iter().enumerate() {
+                for hash160 in hash160s.iter() {
                     let balance = client.get_all_balances(hash160).await;
                     results.push(balance);
                     balance_progress.inc(1);
-
-                    // Add small delay every 10 queries to avoid overwhelming the server
-                    if (i + 1) % 10 == 0 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
                 }
 
                 results
@@ -839,9 +938,11 @@ fn run_scan(
 
     log::info!("=== Scan Complete ===");
     log::info!("Total checked: {}", total_checked);
+    log::info!("Known skipped: {}", known_skipped.load(Ordering::Relaxed));
     log::info!("Bloom hits: {}", bloom_hits.load(Ordering::Relaxed));
     log::info!("FP64 hits: {}", fp64_hits.load(Ordering::Relaxed));
     log::info!("Matches found: {}", matches_found.load(Ordering::Relaxed));
+    log::info!("New matches added to known DB: {}", new_matches.load(Ordering::Relaxed));
     log::info!("Time elapsed: {:?}", elapsed);
     log::info!("Rate: {:.2} passphrases/sec", rate);
 
@@ -1055,6 +1156,271 @@ fn run_test(passphrase: String, data_dir: PathBuf, electrs_addr: Option<String>)
     Ok(())
 }
 
+/// Import brain wallet records from matches.txt format
+fn run_import(input_path: PathBuf, database_path: PathBuf) -> Result<()> {
+    log::info!("Importing brain wallet records from {:?}...", input_path);
+
+    let mut db = KnownBrainWalletsDb::open(&database_path)?;
+    let initial_count = db.len();
+
+    let content = std::fs::read_to_string(&input_path)
+        .with_context(|| format!("Failed to read {:?}", input_path))?;
+
+    // Parse matches.txt format
+    let mut imported = 0;
+    let mut duplicates = 0;
+
+    // Temporary fields for building a record
+    let mut passphrase = String::new();
+    let mut private_key_hex = String::new();
+    let mut private_key_wif = String::new();
+    let mut public_key_hex = String::new();
+    let mut hash160_hex = String::new();
+    let mut address_p2pkh = String::new();
+    let mut address_p2wpkh = String::new();
+    let mut address_p2sh_p2wpkh = String::new();
+    let mut first_seen_height: u32 = 0;
+    let mut pubkey_type = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        if line.starts_with("=== MATCH FOUND ===") {
+            // Start of a new record - save previous if exists
+            if !hash160_hex.is_empty() {
+                let record = KnownBrainWalletsDb::create_record(
+                    passphrase.clone(),
+                    private_key_hex.clone(),
+                    private_key_wif.clone(),
+                    public_key_hex.clone(),
+                    hash160_hex.clone(),
+                    address_p2pkh.clone(),
+                    address_p2wpkh.clone(),
+                    address_p2sh_p2wpkh.clone(),
+                    first_seen_height,
+                    pubkey_type.clone(),
+                );
+                if db.insert(record) {
+                    imported += 1;
+                } else {
+                    duplicates += 1;
+                }
+            }
+
+            // Reset for new record
+            passphrase.clear();
+            private_key_hex.clear();
+            private_key_wif.clear();
+            public_key_hex.clear();
+            hash160_hex.clear();
+            address_p2pkh.clear();
+            address_p2wpkh.clear();
+            address_p2sh_p2wpkh.clear();
+            first_seen_height = 0;
+            pubkey_type.clear();
+        } else if let Some(value) = line.strip_prefix("Passphrase: ") {
+            passphrase = value.to_string();
+        } else if let Some(value) = line.strip_prefix("Private Key (hex): ") {
+            private_key_hex = value.to_string();
+        } else if let Some(value) = line.strip_prefix("Private Key (WIF): ") {
+            private_key_wif = value.to_string();
+        } else if let Some(value) = line.strip_prefix("Public Key: ") {
+            public_key_hex = value.to_string();
+        } else if let Some(value) = line.strip_prefix("HASH160: ") {
+            hash160_hex = value.to_string();
+        } else if let Some(value) = line.strip_prefix("P2PKH (Legacy):") {
+            address_p2pkh = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("P2WPKH (SegWit):") {
+            address_p2wpkh = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("P2SH-P2WPKH (Nested):") {
+            address_p2sh_p2wpkh = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("First Seen Height: ") {
+            first_seen_height = value.parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("Pubkey Type: ") {
+            pubkey_type = value.to_string();
+        }
+    }
+
+    // Don't forget the last record
+    if !hash160_hex.is_empty() {
+        let record = KnownBrainWalletsDb::create_record(
+            passphrase,
+            private_key_hex,
+            private_key_wif,
+            public_key_hex,
+            hash160_hex,
+            address_p2pkh,
+            address_p2wpkh,
+            address_p2sh_p2wpkh,
+            first_seen_height,
+            pubkey_type,
+        );
+        if db.insert(record) {
+            imported += 1;
+        } else {
+            duplicates += 1;
+        }
+    }
+
+    db.save()?;
+
+    log::info!("=== Import Complete ===");
+    log::info!("Initial records in database: {}", initial_count);
+    log::info!("New records imported: {}", imported);
+    log::info!("Duplicates skipped: {}", duplicates);
+    log::info!("Total records in database: {}", db.len());
+
+    Ok(())
+}
+
+/// List known brain wallets
+fn run_list(database_path: PathBuf, format: String, limit: usize) -> Result<()> {
+    let db = KnownBrainWalletsDb::open(&database_path)?;
+
+    if db.is_empty() {
+        println!("No known brain wallets in database.");
+        return Ok(());
+    }
+
+    let records: Vec<_> = if limit == 0 {
+        db.all_records().collect()
+    } else {
+        db.all_records().take(limit).collect()
+    };
+
+    match format.as_str() {
+        "json" => {
+            for record in &records {
+                println!("{}", serde_json::to_string(record)?);
+            }
+        }
+        "csv" => {
+            println!("passphrase,hash160,address_p2pkh,first_seen_height,pubkey_type");
+            for record in &records {
+                println!(
+                    "{},{},{},{},{}",
+                    record.passphrase.replace(',', "\\,"),
+                    record.hash160_hex,
+                    record.address_p2pkh,
+                    record.first_seen_height,
+                    record.pubkey_type
+                );
+            }
+        }
+        _ => {
+            // Table format
+            println!("{:=<100}", "");
+            println!("{:<40} {:>15} {:>35}", "Passphrase", "Height", "P2PKH Address");
+            println!("{:=<100}", "");
+            for record in &records {
+                let passphrase_display = if record.passphrase.len() > 38 {
+                    format!("{}...", &record.passphrase[..35])
+                } else {
+                    record.passphrase.clone()
+                };
+                println!(
+                    "{:<40} {:>15} {:>35}",
+                    passphrase_display,
+                    record.first_seen_height,
+                    record.address_p2pkh
+                );
+            }
+            println!("{:=<100}", "");
+            println!("Total: {} records", db.len());
+            if limit > 0 && db.len() > limit {
+                println!("(Showing first {} of {} records, use --limit 0 to show all)", limit, db.len());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show statistics about known brain wallets database
+fn run_stats(database_path: PathBuf) -> Result<()> {
+    let db = KnownBrainWalletsDb::open(&database_path)?;
+    let stats = db.stats();
+
+    println!("=== Known Brain Wallets Database Statistics ===");
+    println!("Database path: {:?}", database_path);
+    println!("Total records: {}", stats.total_records);
+    println!("Unique passphrases: {}", stats.unique_passphrases);
+    if stats.total_records > 0 {
+        println!("Earliest block height: {}", stats.earliest_block_height);
+        println!("Latest block height: {}", stats.latest_block_height);
+    }
+
+    Ok(())
+}
+
+/// Export known brain wallets to a file
+fn run_export(database_path: PathBuf, output_path: PathBuf, format: String) -> Result<()> {
+    let db = KnownBrainWalletsDb::open(&database_path)?;
+
+    if db.is_empty() {
+        log::warn!("No records to export.");
+        return Ok(());
+    }
+
+    log::info!("Exporting {} records to {:?}...", db.len(), output_path);
+
+    let file = File::create(&output_path)?;
+    let mut writer = BufWriter::new(file);
+
+    match format.as_str() {
+        "json" => {
+            let records: Vec<_> = db.all_records().collect();
+            let json = serde_json::to_string_pretty(&records)?;
+            writeln!(writer, "{}", json)?;
+        }
+        "csv" => {
+            writeln!(writer, "passphrase,private_key_hex,private_key_wif,public_key_hex,hash160,address_p2pkh,address_p2wpkh,address_p2sh_p2wpkh,first_seen_height,pubkey_type")?;
+            for record in db.all_records() {
+                writeln!(
+                    writer,
+                    "\"{}\",{},{},{},{},{},{},{},{},{}",
+                    record.passphrase.replace('"', "\"\""),
+                    record.private_key_hex,
+                    record.private_key_wif,
+                    record.public_key_hex,
+                    record.hash160_hex,
+                    record.address_p2pkh,
+                    record.address_p2wpkh,
+                    record.address_p2sh_p2wpkh,
+                    record.first_seen_height,
+                    record.pubkey_type
+                )?;
+            }
+        }
+        _ => {
+            // txt format (matches.txt compatible)
+            for record in db.all_records() {
+                writeln!(writer, "=== MATCH FOUND ===")?;
+                writeln!(writer, "Passphrase: {}", record.passphrase)?;
+                writeln!(writer, "Private Key (hex): {}", record.private_key_hex)?;
+                writeln!(writer, "Private Key (WIF): {}", record.private_key_wif)?;
+                writeln!(writer, "Public Key: {}", record.public_key_hex)?;
+                writeln!(writer, "HASH160: {}", record.hash160_hex)?;
+                writeln!(writer)?;
+                writeln!(writer, "Addresses:")?;
+                writeln!(writer, "  P2PKH (Legacy):       {}", record.address_p2pkh)?;
+                writeln!(writer, "  P2WPKH (SegWit):      {}", record.address_p2wpkh)?;
+                writeln!(writer, "  P2SH-P2WPKH (Nested): {}", record.address_p2sh_p2wpkh)?;
+                writeln!(writer)?;
+                writeln!(writer, "First Seen Height: {}", record.first_seen_height)?;
+                writeln!(writer, "Pubkey Type: {}", record.pubkey_type)?;
+                writeln!(writer, "==================")?;
+                writeln!(writer)?;
+            }
+        }
+    }
+
+    writer.flush()?;
+    log::info!("Export complete.");
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -1073,8 +1439,10 @@ fn main() -> Result<()> {
             with_variations,
             electrs,
             balance_output,
+            known_db,
+            no_known_db,
         } => {
-            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output)?;
+            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db)?;
         }
         Commands::Generate {
             input,
@@ -1088,6 +1456,18 @@ fn main() -> Result<()> {
         }
         Commands::Test { passphrase, data_dir, electrs } => {
             run_test(passphrase, data_dir, electrs)?;
+        }
+        Commands::Import { input, database } => {
+            run_import(input, database)?;
+        }
+        Commands::List { database, format, limit } => {
+            run_list(database, format, limit)?;
+        }
+        Commands::Stats { database } => {
+            run_stats(database)?;
+        }
+        Commands::Export { database, output, format } => {
+            run_export(database, output, format)?;
         }
     }
 

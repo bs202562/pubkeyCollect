@@ -174,6 +174,71 @@ Pubkey Type: Legacy
 ==================
 ```
 
+## 已知脑钱包数据库
+
+程序会自动维护一个已知脑钱包数据库（`known_brainwallets.jsonl`），用于：
+
+1. **避免重复扫描**：已知的脑钱包会在扫描时自动跳过
+2. **自动收集新发现**：新匹配的脑钱包会自动添加到数据库
+3. **持久化存储**：使用 JSON Lines 格式，便于查看和编辑
+
+### 管理已知脑钱包
+
+**从 matches.txt 导入现有记录：**
+```bash
+brain-wallet import -i matches.txt -d known_brainwallets.jsonl
+```
+
+**查看已知脑钱包列表：**
+```bash
+# 表格格式（默认）
+brain-wallet list
+
+# JSON 格式
+brain-wallet list --format json
+
+# CSV 格式
+brain-wallet list --format csv
+
+# 显示所有记录
+brain-wallet list --limit 0
+```
+
+**查看数据库统计信息：**
+```bash
+brain-wallet stats
+```
+
+**导出到文件：**
+```bash
+# 导出为 txt 格式（兼容 matches.txt）
+brain-wallet export -o exported.txt
+
+# 导出为 JSON 格式
+brain-wallet export -o exported.json --format json
+
+# 导出为 CSV 格式
+brain-wallet export -o exported.csv --format csv
+```
+
+### 扫描时的行为
+
+默认情况下，扫描会：
+- 加载已知脑钱包数据库
+- 跳过已知的 HASH160（避免重复）
+- 将新发现的匹配自动添加到数据库
+
+```bash
+# 使用默认数据库路径
+brain-wallet scan -i wordlists/common_passphrases.txt
+
+# 指定自定义数据库路径
+brain-wallet scan -i wordlists/common_passphrases.txt --known-db my_brainwallets.jsonl
+
+# 禁用已知脑钱包追踪（每次都完整扫描）
+brain-wallet scan -i wordlists/common_passphrases.txt --no-known-db
+```
+
 ## Electrs 余额查询
 
 当配置了 `--electrs` 参数时，程序会通过 Electrum 协议连接到 electrs 服务器，查询以下三种地址类型的余额：
