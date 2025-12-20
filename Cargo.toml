@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "brain-wallet"
 path = "src/bin/brain_wallet.rs"
 
+[[bin]]
+name = "merge-wordlists"
+path = "src/bin/merge_wordlists.rs"
+
 [lib]
 name = "collect_pubkey"
 path = "src/lib.rs"
@@ -55,6 +59,7 @@ anyhow = "1.0"
 # Utilities
 hex = "0.4"
 bs58 = "0.5"
+walkdir = "2.5"
 
 # Networking (for Electrum protocol)
 tokio = { version = "1.0", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }

@@ -87,6 +87,11 @@ enum Commands {
         /// Disable known brain wallets tracking
         #[arg(long)]
         no_known_db: bool,
+
+        /// Batch size for processing (useful for large files with --with-variations)
+        /// When set, processes passphrases in batches to reduce memory usage
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
 
     /// Generate passphrases from a text file (split by sentences, phrases, etc.)
@@ -697,103 +702,23 @@ fn private_key_to_wif(privkey: &[u8; 32]) -> String {
     bs58::encode(data).into_string()
 }
 
-fn run_scan(
-    input_files: Vec<PathBuf>,
-    data_dir: PathBuf,
-    output_path: PathBuf,
-    threads: Option<usize>,
-    skip_bloom: bool,
-    with_variations: bool,
-    electrs_addr: Option<String>,
-    balance_output_path: PathBuf,
-    known_db_path: PathBuf,
-    no_known_db: bool,
-) -> Result<()> {
-    // Set thread count
-    if let Some(t) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(t)
-            .build_global()
-            .ok();
-    }
-
-    // Load known brain wallets database
-    let known_db = if !no_known_db {
-        log::info!("Loading known brain wallets database from {:?}...", known_db_path);
-        let db = KnownBrainWalletsDb::open(&known_db_path)?;
-        log::info!("Loaded {} known brain wallet records", db.len());
-        Some(Arc::new(RwLock::new(db)))
-    } else {
-        log::info!("Known brain wallets tracking disabled");
-        None
-    };
-
-    // Load scanner
-    let scanner = Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?);
-
-    // Collect all passphrases
-    log::info!("Reading passphrases from input files...");
-    let mut passphrases: Vec<String> = Vec::new();
-
-    for input_path in &input_files {
-        let file = File::open(input_path)
-            .with_context(|| format!("Failed to open {:?}", input_path))?;
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line?;
-            if !line.is_empty() {
-                if with_variations {
-                    passphrases.extend(generate_variations(&line));
-                } else {
-                    passphrases.push(line);
-                }
-            }
-        }
-    }
-
-    // Remove duplicates
-    let original_count = passphrases.len();
-    let mut seen = HashSet::new();
-    passphrases.retain(|p| seen.insert(p.clone()));
-    log::info!(
-        "Loaded {} unique passphrases (from {} total)",
-        passphrases.len(),
-        original_count
-    );
-
-    // Progress bar
-    let progress = ProgressBar::new(passphrases.len() as u64);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    // Counters
-    let checked = AtomicU64::new(0);
-    let bloom_hits = AtomicU64::new(0);
-    let fp64_hits = AtomicU64::new(0);
-    let matches_found = AtomicU64::new(0);
-    let known_skipped = AtomicU64::new(0);
-    let new_matches = AtomicU64::new(0);
-
-    // Electrs client (if configured)
-    let electrum_client = electrs_addr.as_ref().map(|addr| {
-        log::info!("Electrs server configured: {}", addr);
-        Arc::new(ElectrumClient::new(addr))
-    });
-
-    // Results collector (with hash160 for later balance queries)
-    let results: Arc<Mutex<Vec<MatchResult>>> = Arc::new(Mutex::new(Vec::new()));
-    // Pending matches that need balance queries
-    let pending_matches: Arc<Mutex<Vec<MatchResult>>> = Arc::new(Mutex::new(Vec::new()));
-
-    // Process in parallel
-    let start = Instant::now();
-
-    passphrases.par_iter().for_each(|passphrase| {
+/// Process a batch of passphrases in parallel
+fn process_batch(
+    batch: &[String],
+    scanner: &Arc<CollisionScanner>,
+    known_db: &Option<Arc<RwLock<KnownBrainWalletsDb>>>,
+    electrum_client: &Option<Arc<ElectrumClient>>,
+    results: &Arc<Mutex<Vec<MatchResult>>>,
+    pending_matches: &Arc<Mutex<Vec<MatchResult>>>,
+    checked: &AtomicU64,
+    bloom_hits: &AtomicU64,
+    fp64_hits: &AtomicU64,
+    matches_found: &AtomicU64,
+    known_skipped: &AtomicU64,
+    new_matches: &AtomicU64,
+    progress: &ProgressBar,
+) {
+    batch.par_iter().for_each(|passphrase| {
         // Derive brain wallet
         match derive_brain_wallet(passphrase) {
             Ok((privkey, pubkey, hash160, addresses)) => {
@@ -846,7 +771,7 @@ fn run_scan(
                             record.first_seen_height,
                             format!("{:?}", record.pubkey_type),
                         );
-                        
+
                         if let Ok(mut db) = known_db.write() {
                             if let Ok(true) = db.append_record(known_record) {
                                 new_matches.fetch_add(1, Ordering::Relaxed);
@@ -873,8 +798,221 @@ fn run_scan(
 
         progress.inc(1);
     });
+}
+
+fn run_scan(
+    input_files: Vec<PathBuf>,
+    data_dir: PathBuf,
+    output_path: PathBuf,
+    threads: Option<usize>,
+    skip_bloom: bool,
+    with_variations: bool,
+    electrs_addr: Option<String>,
+    balance_output_path: PathBuf,
+    known_db_path: PathBuf,
+    no_known_db: bool,
+    batch_size: Option<usize>,
+) -> Result<()> {
+    // Set thread count
+    if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build_global()
+            .ok();
+    }
+
+    // Load known brain wallets database
+    let known_db = if !no_known_db {
+        log::info!("Loading known brain wallets database from {:?}...", known_db_path);
+        let db = KnownBrainWalletsDb::open(&known_db_path)?;
+        log::info!("Loaded {} known brain wallet records", db.len());
+        Some(Arc::new(RwLock::new(db)))
+    } else {
+        log::info!("Known brain wallets tracking disabled");
+        None
+    };
+
+    // Load scanner
+    let scanner = Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?);
+
+    // Counters
+    let checked = AtomicU64::new(0);
+    let bloom_hits = AtomicU64::new(0);
+    let fp64_hits = AtomicU64::new(0);
+    let matches_found = AtomicU64::new(0);
+    let known_skipped = AtomicU64::new(0);
+    let new_matches = AtomicU64::new(0);
+    let total_processed = AtomicU64::new(0);
+
+    // Electrs client (if configured)
+    let electrum_client = electrs_addr.as_ref().map(|addr| {
+        log::info!("Electrs server configured: {}", addr);
+        Arc::new(ElectrumClient::new(addr))
+    });
+
+    // Results collector (with hash160 for later balance queries)
+    let results: Arc<Mutex<Vec<MatchResult>>> = Arc::new(Mutex::new(Vec::new()));
+    // Pending matches that need balance queries
+    let pending_matches: Arc<Mutex<Vec<MatchResult>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Global dedup set for streaming mode (persists across batches)
+    let global_seen: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    let start = Instant::now();
+
+    // Determine processing mode
+    let use_batch_mode = batch_size.is_some();
+    let batch_sz = batch_size.unwrap_or(1_000_000);
+
+    if use_batch_mode {
+        log::info!("Using batch processing mode with batch size: {}", batch_sz);
+    }
+
+    // Count total lines first for progress bar (quick scan)
+    log::info!("Counting lines in input files...");
+    let mut total_lines: u64 = 0;
+    for input_path in &input_files {
+        let file = File::open(input_path)
+            .with_context(|| format!("Failed to open {:?}", input_path))?;
+        let reader = BufReader::new(file);
+        total_lines += reader.lines().count() as u64;
+    }
+    
+    // Estimate total with variations (rough estimate: ~15 variations per line)
+    let estimated_total = if with_variations {
+        total_lines * 15
+    } else {
+        total_lines
+    };
+    
+    log::info!("Total lines: {}, estimated passphrases: {}", total_lines, estimated_total);
+
+    // Progress bar
+    let progress = ProgressBar::new(estimated_total);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    // Process files in streaming/batch mode
+    let mut batch: Vec<String> = Vec::with_capacity(batch_sz);
+    let mut batch_num = 0u64;
+
+    for input_path in &input_files {
+        log::info!("Processing file: {:?}", input_path);
+        
+        let file = File::open(input_path)
+            .with_context(|| format!("Failed to open {:?}", input_path))?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+
+            // Generate variations if needed
+            let phrases: Vec<String> = if with_variations {
+                generate_variations(&line)
+            } else {
+                vec![line]
+            };
+
+            for phrase in phrases {
+                // Quick dedup check for batch mode
+                if use_batch_mode {
+                    // Check global seen set
+                    let seen_read = global_seen.read().unwrap();
+                    if seen_read.contains(&phrase) {
+                        continue;
+                    }
+                    drop(seen_read);
+                }
+
+                batch.push(phrase);
+
+                // Process batch when full
+                if batch.len() >= batch_sz {
+                    batch_num += 1;
+                    
+                    // Dedup within batch
+                    let mut batch_seen = HashSet::new();
+                    batch.retain(|p| batch_seen.insert(p.clone()));
+
+                    // Also dedup against global seen (for batch mode)
+                    if use_batch_mode {
+                        let mut seen_write = global_seen.write().unwrap();
+                        batch.retain(|p| seen_write.insert(p.clone()));
+                    }
+
+                    let batch_size_actual = batch.len();
+                    log::debug!("Processing batch {} with {} passphrases", batch_num, batch_size_actual);
+
+                    // Process this batch in parallel
+                    process_batch(
+                        &batch,
+                        &scanner,
+                        &known_db,
+                        &electrum_client,
+                        &results,
+                        &pending_matches,
+                        &checked,
+                        &bloom_hits,
+                        &fp64_hits,
+                        &matches_found,
+                        &known_skipped,
+                        &new_matches,
+                        &progress,
+                    );
+
+                    total_processed.fetch_add(batch_size_actual as u64, Ordering::Relaxed);
+                    batch.clear();
+                }
+            }
+        }
+    }
+
+    // Process remaining batch
+    if !batch.is_empty() {
+        batch_num += 1;
+        
+        // Dedup within batch
+        let mut batch_seen = HashSet::new();
+        batch.retain(|p| batch_seen.insert(p.clone()));
+
+        // Also dedup against global seen (for batch mode)
+        if use_batch_mode {
+            let mut seen_write = global_seen.write().unwrap();
+            batch.retain(|p| seen_write.insert(p.clone()));
+        }
+
+        let batch_size_actual = batch.len();
+        log::debug!("Processing final batch {} with {} passphrases", batch_num, batch_size_actual);
+
+        process_batch(
+            &batch,
+            &scanner,
+            &known_db,
+            &electrum_client,
+            &results,
+            &pending_matches,
+            &checked,
+            &bloom_hits,
+            &fp64_hits,
+            &matches_found,
+            &known_skipped,
+            &new_matches,
+            &progress,
+        );
+
+        total_processed.fetch_add(batch_size_actual as u64, Ordering::Relaxed);
+    }
 
     progress.finish();
+
+    log::info!("Processed {} batches, {} total unique passphrases", batch_num, total_processed.load(Ordering::Relaxed));
 
     // Query balances for matches if electrs is configured
     let final_results = if let Some(ref client) = electrum_client {
@@ -1441,8 +1579,9 @@ fn main() -> Result<()> {
             balance_output,
             known_db,
             no_known_db,
+            batch_size,
         } => {
-            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db)?;
+            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db, batch_size)?;
         }
         Commands::Generate {
             input,
