@@ -75,6 +75,9 @@ brain-wallet scan -i wordlists/common_passphrases.txt --electrs 192.168.1.19:500
 - `--with-variations`: 生成密码短语变体（大小写、添加后缀等）
 - `--electrs`: Electrs 服务器地址（例如 `192.168.1.19:50001`），用于查询余额
 - `--balance-output`: 有余额的匹配结果单独保存文件（默认 `matches_with_balance.txt`）
+- `--resume`: 从上次中断的位置恢复扫描
+- `--progress-file`: 进度缓存文件路径（默认 `.brain_wallet_progress.json`）
+- `--save-interval`: 自动保存进度的间隔秒数（默认 30 秒）
 
 ### 3. 从文本生成密码短语
 
@@ -237,6 +240,80 @@ brain-wallet scan -i wordlists/common_passphrases.txt --known-db my_brainwallets
 
 # 禁用已知脑钱包追踪（每次都完整扫描）
 brain-wallet scan -i wordlists/common_passphrases.txt --no-known-db
+```
+
+## 断点续传（大文件扫描）
+
+当扫描超大文件（如 40GB+）时，程序可能因为各种原因中断。为了支持从中断处继续扫描，程序提供了进度缓存功能。
+
+### 工作原理
+
+1. **自动保存进度**: 程序会每隔 N 秒（默认 30 秒）自动保存当前进度到缓存文件
+2. **优雅退出**: 按 Ctrl+C 会触发优雅退出，程序会保存当前进度后再退出
+3. **恢复扫描**: 使用 `--resume` 参数可以从上次中断的位置继续扫描
+4. **自动清理**: 扫描成功完成后，进度文件会自动删除
+
+### 使用方法
+
+**正常扫描（自动保存进度）：**
+```bash
+brain-wallet scan -i huge_wordlist.txt -d output -o matches.txt
+```
+
+**从中断处恢复：**
+```bash
+brain-wallet scan -i huge_wordlist.txt -d output -o matches.txt --resume
+```
+
+**自定义保存间隔和进度文件：**
+```bash
+# 每 60 秒保存一次进度
+brain-wallet scan -i huge_wordlist.txt --save-interval 60 --resume
+
+# 使用自定义进度文件路径
+brain-wallet scan -i huge_wordlist.txt --progress-file my_progress.json --resume
+```
+
+### 进度文件格式
+
+进度文件（默认 `.brain_wallet_progress.json`）包含以下信息：
+
+```json
+{
+  "current_file_index": 0,
+  "current_file_offset": 1234567890,
+  "current_line_number": 50000000,
+  "total_lines_processed": 50000000,
+  "total_checked": 49500000,
+  "known_skipped": 500000,
+  "bloom_hits": 1234,
+  "fp64_hits": 567,
+  "matches_found": 42,
+  "new_matches": 10,
+  "input_files": ["huge_wordlist.txt"],
+  "last_save_timestamp": 1703123456,
+  "with_variations": false
+}
+```
+
+### 注意事项
+
+1. **输入文件必须一致**: 恢复时必须使用与上次完全相同的输入文件列表和顺序
+2. **变体模式必须一致**: `--with-variations` 设置必须与上次保持一致
+3. **不要修改输入文件**: 在恢复之前不要修改输入文件内容，否则字节偏移会不正确
+4. **批处理模式**: 对于超大文件，建议同时使用 `--batch-size` 参数控制内存使用
+
+### 推荐的大文件扫描配置
+
+```bash
+# 扫描 40GB+ 文件的推荐配置
+brain-wallet scan \
+  -i huge_wordlist.txt \
+  -d output \
+  -o matches.txt \
+  --batch-size 1000000 \
+  --save-interval 30 \
+  --resume
 ```
 
 ## Electrs 余额查询

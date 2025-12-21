@@ -10,6 +10,11 @@
 //! 1. Bloom filter check (very fast)
 //! 2. FP64 table lookup (fast binary search)
 //! 3. RocksDB precise lookup (only for confirmed hits)
+//!
+//! Progress checkpoint support:
+//! - Use --resume to continue from last checkpoint
+//! - Progress is saved automatically every N seconds or lines
+//! - Graceful shutdown on Ctrl+C saves progress
 
 use anyhow::{Context, Result};
 use bitcoin::address::Address;
@@ -23,17 +28,75 @@ use collect_pubkey::storage::known_brainwallets::KnownBrainWalletsDb;
 use indicatif::{ProgressBar, ProgressStyle};
 use ripemd::Ripemd160;
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use rayon::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream;
+
+/// Progress checkpoint for resumable scanning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanProgress {
+    /// Index of current file being processed (0-based)
+    current_file_index: usize,
+    /// Byte offset in current file (for seeking)
+    current_file_offset: u64,
+    /// Line number in current file (for display/verification)
+    current_line_number: u64,
+    /// Total lines processed across all files
+    total_lines_processed: u64,
+    /// Total passphrases checked
+    total_checked: u64,
+    /// Known brain wallets skipped
+    known_skipped: u64,
+    /// Bloom filter hits
+    bloom_hits: u64,
+    /// FP64 hits
+    fp64_hits: u64,
+    /// Matches found
+    matches_found: u64,
+    /// New matches added to known DB
+    new_matches: u64,
+    /// Input files (for verification)
+    input_files: Vec<String>,
+    /// Timestamp of last save
+    last_save_timestamp: u64,
+    /// Whether variations mode is enabled
+    with_variations: bool,
+}
+
+impl ScanProgress {
+    fn save(&self, path: &PathBuf) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn load(path: &PathBuf) -> Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let progress: ScanProgress = serde_json::from_str(&json)?;
+        Ok(progress)
+    }
+
+    fn verify_input_files(&self, input_files: &[PathBuf]) -> bool {
+        if self.input_files.len() != input_files.len() {
+            return false;
+        }
+        for (i, path) in input_files.iter().enumerate() {
+            if path.to_string_lossy() != self.input_files[i] {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Brain Wallet Collision Scanner
 #[derive(Parser)]
@@ -92,6 +155,18 @@ enum Commands {
         /// When set, processes passphrases in batches to reduce memory usage
         #[arg(long)]
         batch_size: Option<usize>,
+
+        /// Resume from previous progress checkpoint
+        #[arg(long)]
+        resume: bool,
+
+        /// Progress file path for checkpoint (default: .brain_wallet_progress.json)
+        #[arg(long, default_value = ".brain_wallet_progress.json")]
+        progress_file: PathBuf,
+
+        /// Save progress every N seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        save_interval: u64,
     },
 
     /// Generate passphrases from a text file (split by sentences, phrases, etc.)
@@ -812,6 +887,9 @@ fn run_scan(
     known_db_path: PathBuf,
     no_known_db: bool,
     batch_size: Option<usize>,
+    resume: bool,
+    progress_file: PathBuf,
+    save_interval: u64,
 ) -> Result<()> {
     // Set thread count
     if let Some(t) = threads {
@@ -819,6 +897,68 @@ fn run_scan(
             .num_threads(t)
             .build_global()
             .ok();
+    }
+
+    // Setup Ctrl+C handler for graceful shutdown
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = shutdown_flag.clone();
+    ctrlc::set_handler(move || {
+        log::warn!("Received Ctrl+C, initiating graceful shutdown...");
+        shutdown_flag_clone.store(true, Ordering::SeqCst);
+    }).expect("Failed to set Ctrl+C handler");
+
+    // Check for resume mode
+    let mut start_file_index: usize = 0;
+    let mut start_file_offset: u64 = 0;
+    let mut start_line_number: u64 = 0;
+    let mut initial_checked: u64 = 0;
+    let mut initial_known_skipped: u64 = 0;
+    let mut initial_bloom_hits: u64 = 0;
+    let mut initial_fp64_hits: u64 = 0;
+    let mut initial_matches_found: u64 = 0;
+    let mut initial_new_matches: u64 = 0;
+    let mut initial_total_processed: u64 = 0;
+
+    if resume && progress_file.exists() {
+        log::info!("Attempting to resume from {:?}...", progress_file);
+        match ScanProgress::load(&progress_file) {
+            Ok(progress) => {
+                // Verify input files match
+                if !progress.verify_input_files(&input_files) {
+                    log::error!("Input files don't match the progress file. Cannot resume.");
+                    log::error!("Expected: {:?}", progress.input_files);
+                    log::error!("Got: {:?}", input_files.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>());
+                    anyhow::bail!("Input files mismatch. Use different progress file or remove --resume");
+                }
+
+                // Verify variations mode matches
+                if progress.with_variations != with_variations {
+                    log::error!("Variations mode doesn't match. Progress: {}, Current: {}", progress.with_variations, with_variations);
+                    anyhow::bail!("Variations mode mismatch. Use same --with-variations setting or remove --resume");
+                }
+
+                start_file_index = progress.current_file_index;
+                start_file_offset = progress.current_file_offset;
+                start_line_number = progress.current_line_number;
+                initial_checked = progress.total_checked;
+                initial_known_skipped = progress.known_skipped;
+                initial_bloom_hits = progress.bloom_hits;
+                initial_fp64_hits = progress.fp64_hits;
+                initial_matches_found = progress.matches_found;
+                initial_new_matches = progress.new_matches;
+                initial_total_processed = progress.total_lines_processed;
+
+                log::info!("Resuming from file {}/{} at line {}", 
+                    start_file_index + 1, input_files.len(), start_line_number);
+                log::info!("Previous progress: {} checked, {} matches found", 
+                    initial_checked, initial_matches_found);
+            }
+            Err(e) => {
+                log::warn!("Failed to load progress file: {}. Starting from beginning.", e);
+            }
+        }
+    } else if resume {
+        log::info!("No progress file found at {:?}. Starting from beginning.", progress_file);
     }
 
     // Load known brain wallets database
@@ -835,14 +975,20 @@ fn run_scan(
     // Load scanner
     let scanner = Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?);
 
-    // Counters
-    let checked = AtomicU64::new(0);
-    let bloom_hits = AtomicU64::new(0);
-    let fp64_hits = AtomicU64::new(0);
-    let matches_found = AtomicU64::new(0);
-    let known_skipped = AtomicU64::new(0);
-    let new_matches = AtomicU64::new(0);
-    let total_processed = AtomicU64::new(0);
+    // Counters (initialized from resume state if applicable)
+    let checked = AtomicU64::new(initial_checked);
+    let bloom_hits = AtomicU64::new(initial_bloom_hits);
+    let fp64_hits = AtomicU64::new(initial_fp64_hits);
+    let matches_found = AtomicU64::new(initial_matches_found);
+    let known_skipped = AtomicU64::new(initial_known_skipped);
+    let new_matches = AtomicU64::new(initial_new_matches);
+    let total_processed = AtomicU64::new(initial_total_processed);
+
+    // Progress tracking for checkpoint saves
+    let current_file_index = Arc::new(AtomicU64::new(start_file_index as u64));
+    let current_file_offset = Arc::new(AtomicU64::new(start_file_offset));
+    let current_line_number = Arc::new(AtomicU64::new(start_line_number));
+    let last_save_time = Arc::new(Mutex::new(Instant::now()));
 
     // Electrs client (if configured)
     let electrum_client = electrs_addr.as_ref().map(|addr| {
@@ -896,28 +1042,93 @@ fn run_scan(
             .progress_chars("#>-"),
     );
 
+    // Helper function to save progress checkpoint
+    let save_progress = |file_idx: usize, file_offset: u64, line_num: u64| -> Result<()> {
+        let progress_data = ScanProgress {
+            current_file_index: file_idx,
+            current_file_offset: file_offset,
+            current_line_number: line_num,
+            total_lines_processed: total_processed.load(Ordering::Relaxed),
+            total_checked: checked.load(Ordering::Relaxed),
+            known_skipped: known_skipped.load(Ordering::Relaxed),
+            bloom_hits: bloom_hits.load(Ordering::Relaxed),
+            fp64_hits: fp64_hits.load(Ordering::Relaxed),
+            matches_found: matches_found.load(Ordering::Relaxed),
+            new_matches: new_matches.load(Ordering::Relaxed),
+            input_files: input_files.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            last_save_timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            with_variations,
+        };
+        progress_data.save(&progress_file)?;
+        log::info!("Progress saved: file {}/{}, line {}, checked {}, matches {}",
+            file_idx + 1, input_files.len(), line_num,
+            checked.load(Ordering::Relaxed), matches_found.load(Ordering::Relaxed));
+        Ok(())
+    };
+
     // Process files in streaming/batch mode
     let mut batch: Vec<String> = Vec::with_capacity(batch_sz);
     let mut batch_num = 0u64;
+    let mut shutdown_requested = false;
 
-    for input_path in &input_files {
-        log::info!("Processing file: {:?}", input_path);
+    'file_loop: for (file_idx, input_path) in input_files.iter().enumerate() {
+        // Skip files before resume point
+        if file_idx < start_file_index {
+            log::debug!("Skipping already processed file: {:?}", input_path);
+            continue;
+        }
+
+        current_file_index.store(file_idx as u64, Ordering::Relaxed);
+        log::info!("Processing file {}/{}: {:?}", file_idx + 1, input_files.len(), input_path);
         
-        let file = File::open(input_path)
+        let mut file = File::open(input_path)
             .with_context(|| format!("Failed to open {:?}", input_path))?;
-        let reader = BufReader::new(file);
+        
+        // Seek to resume position if this is the resume file
+        let mut local_line_number: u64 = 0;
+        if file_idx == start_file_index && start_file_offset > 0 {
+            log::info!("Seeking to byte offset {} in file", start_file_offset);
+            file.seek(SeekFrom::Start(start_file_offset))?;
+            local_line_number = start_line_number;
+        }
+        
+        let mut reader = BufReader::new(file);
+        let mut current_offset = if file_idx == start_file_index { start_file_offset } else { 0 };
 
-        for line in reader.lines() {
-            let line = line?;
+        let mut line_buf = String::new();
+        loop {
+            // Check for shutdown
+            if shutdown_flag.load(Ordering::SeqCst) {
+                log::warn!("Shutdown requested, saving progress...");
+                shutdown_requested = true;
+                break 'file_loop;
+            }
+
+            line_buf.clear();
+            let bytes_read = reader.read_line(&mut line_buf)?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+
+            let line_start_offset = current_offset;
+            current_offset += bytes_read as u64;
+            local_line_number += 1;
+            current_line_number.store(local_line_number, Ordering::Relaxed);
+            current_file_offset.store(current_offset, Ordering::Relaxed);
+
+            let line = line_buf.trim();
             if line.is_empty() {
                 continue;
             }
 
             // Generate variations if needed
             let phrases: Vec<String> = if with_variations {
-                generate_variations(&line)
+                generate_variations(line)
             } else {
-                vec![line]
+                vec![line.to_string()]
             };
 
             for phrase in phrases {
@@ -969,13 +1180,23 @@ fn run_scan(
 
                     total_processed.fetch_add(batch_size_actual as u64, Ordering::Relaxed);
                     batch.clear();
+
+                    // Check if we should save progress (time-based)
+                    let should_save = {
+                        let last_save = last_save_time.lock().unwrap();
+                        last_save.elapsed().as_secs() >= save_interval
+                    };
+                    if should_save {
+                        save_progress(file_idx, line_start_offset, local_line_number)?;
+                        *last_save_time.lock().unwrap() = Instant::now();
+                    }
                 }
             }
         }
     }
 
     // Process remaining batch
-    if !batch.is_empty() {
+    if !batch.is_empty() && !shutdown_requested {
         batch_num += 1;
         
         // Dedup within batch
@@ -1011,6 +1232,21 @@ fn run_scan(
     }
 
     progress.finish();
+
+    // Save final progress if shutdown was requested
+    if shutdown_requested {
+        let file_idx = current_file_index.load(Ordering::Relaxed) as usize;
+        let file_offset = current_file_offset.load(Ordering::Relaxed);
+        let line_num = current_line_number.load(Ordering::Relaxed);
+        save_progress(file_idx, file_offset, line_num)?;
+        log::warn!("Scan interrupted. Use --resume to continue from saved progress.");
+    } else {
+        // Delete progress file on successful completion
+        if progress_file.exists() {
+            std::fs::remove_file(&progress_file).ok();
+            log::info!("Scan completed. Progress file removed.");
+        }
+    }
 
     log::info!("Processed {} batches, {} total unique passphrases", batch_num, total_processed.load(Ordering::Relaxed));
 
@@ -1580,8 +1816,11 @@ fn main() -> Result<()> {
             known_db,
             no_known_db,
             batch_size,
+            resume,
+            progress_file,
+            save_interval,
         } => {
-            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db, batch_size)?;
+            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db, batch_size, resume, progress_file, save_interval)?;
         }
         Commands::Generate {
             input,
