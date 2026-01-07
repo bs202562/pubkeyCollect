@@ -11,6 +11,14 @@
 3. **公钥 → HASH160**: `RIPEMD160(SHA256(pubkey))` 得到 20 字节哈希
 4. **查询数据库**: 检查 HASH160 是否在已收集的公钥数据库中
 
+### 多哈希变体
+
+除了标准的单次 SHA256 哈希外，某些脑钱包生成器可能使用：
+- **不同的哈希算法**: MD5, SHA1, SHA512, RIPEMD160
+- **多次哈希迭代**: 如 `SHA256(SHA256(passphrase))` 进行双重哈希
+
+程序支持通过 `--multi-hash` 模式遍历这些变体，增加发现匹配的概率。
+
 ## 查询路径（高效）
 
 程序使用三层过滤来高效查询：
@@ -78,8 +86,44 @@ brain-wallet scan -i wordlists/common_passphrases.txt --electrs 192.168.1.19:500
 - `--resume`: 从上次中断的位置恢复扫描
 - `--progress-file`: 进度缓存文件路径（默认 `.brain_wallet_progress.json`）
 - `--save-interval`: 自动保存进度的间隔秒数（默认 30 秒）
+- `--multi-hash`: 启用多哈希遍历模式
+- `--hash-algorithms`: 要尝试的哈希算法（逗号分隔，如 `sha256,md5,sha1`）
+- `--max-iterations`: 每种算法的最大迭代次数（如 2 表示尝试 hash 和 hash(hash)）
 
-### 3. 从文本生成密码短语
+### 3. 多哈希模式扫描
+
+启用多哈希模式可以尝试不同的哈希算法和迭代次数：
+
+```bash
+# 使用 SHA256 和 MD5，各尝试 1-3 次迭代
+brain-wallet scan -i wordlists/common_passphrases.txt --multi-hash --hash-algorithms sha256,md5 --max-iterations 3
+```
+
+支持的哈希算法：
+- `sha256`: 标准脑钱包哈希（32 字节输出）
+- `sha512`: SHA-512（使用前 32 字节）
+- `sha1`: SHA-1（20 字节，后续填充零）
+- `md5`: MD5（16 字节，后续填充零）
+- `ripemd160`: RIPEMD-160（20 字节，后续填充零）
+
+**测试单个密码的多种哈希方式：**
+```bash
+# 标准 SHA256（默认）
+brain-wallet test "password"
+
+# 使用 MD5 算法
+brain-wallet test "password" --hash-algorithm md5
+
+# 使用 SHA256 双重哈希
+brain-wallet test "password" --hash-algorithm sha256 --iterations 2
+```
+
+**多哈希模式的工作量说明：**
+- 假设有 1000 个密码短语
+- 使用 2 种算法（sha256, md5）× 3 次迭代 = 每个密码 6 种派生
+- 总共检查：1000 × 6 = 6000 种派生
+
+### 4. 从文本生成密码短语
 
 ```bash
 brain-wallet generate -i bible.txt -o bible_phrases.txt
@@ -137,6 +181,7 @@ brain-wallet generate -i bible.txt -o bible_phrases.txt
 ```
 === MATCH FOUND ===
 Passphrase: satoshi
+Hash Derivation: sha256(passphrase)
 Private Key (hex): da2876b3eb31edb4436fa4650673fc6f01f90de2f1793c4ec332b2387b09726f
 Private Key (WIF): L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1
 Public Key: 03c4f00a8aa87f595b60b1e390f17fc64d12c1a1f505354a7eea5f2ee353e427b7
@@ -150,6 +195,15 @@ Addresses:
 First Seen Height: 344628
 Pubkey Type: Legacy
 ==================
+```
+
+### 多哈希匹配结果（双重 SHA256）
+```
+=== MATCH FOUND ===
+Passphrase: password123
+Hash Derivation: sha256^2(passphrase)
+Private Key (hex): ...
+...
 ```
 
 ### 带余额查询结果
@@ -292,7 +346,12 @@ brain-wallet scan -i huge_wordlist.txt --progress-file my_progress.json --resume
   "new_matches": 10,
   "input_files": ["huge_wordlist.txt"],
   "last_save_timestamp": 1703123456,
-  "with_variations": false
+  "with_variations": false,
+  "multi_hash_config": {
+    "enabled": true,
+    "algorithms": ["sha256", "md5"],
+    "max_iterations": 2
+  }
 }
 ```
 
@@ -300,8 +359,9 @@ brain-wallet scan -i huge_wordlist.txt --progress-file my_progress.json --resume
 
 1. **输入文件必须一致**: 恢复时必须使用与上次完全相同的输入文件列表和顺序
 2. **变体模式必须一致**: `--with-variations` 设置必须与上次保持一致
-3. **不要修改输入文件**: 在恢复之前不要修改输入文件内容，否则字节偏移会不正确
-4. **批处理模式**: 对于超大文件，建议同时使用 `--batch-size` 参数控制内存使用
+3. **多哈希配置必须一致**: `--multi-hash`, `--hash-algorithms`, `--max-iterations` 设置必须与上次保持一致
+4. **不要修改输入文件**: 在恢复之前不要修改输入文件内容，否则字节偏移会不正确
+5. **批处理模式**: 对于超大文件，建议同时使用 `--batch-size` 参数控制内存使用
 
 ### 推荐的大文件扫描配置
 

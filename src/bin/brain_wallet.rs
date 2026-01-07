@@ -20,26 +20,135 @@ use anyhow::{Context, Result};
 use bitcoin::address::Address;
 use bitcoin::key::CompressedPublicKey;
 use bitcoin::Network;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use collect_pubkey::storage::bloom::BloomFilter;
 use collect_pubkey::storage::cpu_index::{CpuIndex, PubkeyRecord};
 use collect_pubkey::storage::fp64::Fp64Table;
 use collect_pubkey::storage::known_brainwallets::KnownBrainWalletsDb;
 use indicatif::{ProgressBar, ProgressStyle};
+use md5::Md5;
 use ripemd::Ripemd160;
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use rayon::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream;
+
+/// Supported hash algorithms for brain wallet derivation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HashAlgorithm {
+    /// SHA-256 (standard brain wallet)
+    Sha256,
+    /// SHA-512 (first 32 bytes used)
+    Sha512,
+    /// SHA-1 (padded to 32 bytes with zeros)
+    Sha1,
+    /// MD5 (padded to 32 bytes with zeros)
+    Md5,
+    /// RIPEMD-160 (padded to 32 bytes with zeros)
+    Ripemd160,
+}
+
+impl fmt::Display for HashAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HashAlgorithm::Sha256 => write!(f, "sha256"),
+            HashAlgorithm::Sha512 => write!(f, "sha512"),
+            HashAlgorithm::Sha1 => write!(f, "sha1"),
+            HashAlgorithm::Md5 => write!(f, "md5"),
+            HashAlgorithm::Ripemd160 => write!(f, "ripemd160"),
+        }
+    }
+}
+
+impl FromStr for HashAlgorithm {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sha256" => Ok(HashAlgorithm::Sha256),
+            "sha512" => Ok(HashAlgorithm::Sha512),
+            "sha1" => Ok(HashAlgorithm::Sha1),
+            "md5" => Ok(HashAlgorithm::Md5),
+            "ripemd160" => Ok(HashAlgorithm::Ripemd160),
+            _ => Err(format!("Unknown hash algorithm: {}", s)),
+        }
+    }
+}
+
+impl HashAlgorithm {
+    /// Compute the hash of input data and return as 32-byte array
+    /// For algorithms with shorter output, pads with zeros
+    /// For algorithms with longer output, truncates to 32 bytes
+    fn hash(&self, data: &[u8]) -> [u8; 32] {
+        let mut result = [0u8; 32];
+        match self {
+            HashAlgorithm::Sha256 => {
+                let hash = Sha256::digest(data);
+                result.copy_from_slice(&hash);
+            }
+            HashAlgorithm::Sha512 => {
+                let hash = Sha512::digest(data);
+                result.copy_from_slice(&hash[..32]); // Use first 32 bytes
+            }
+            HashAlgorithm::Sha1 => {
+                let hash = Sha1::digest(data);
+                result[..20].copy_from_slice(&hash); // 20 bytes, rest zeros
+            }
+            HashAlgorithm::Md5 => {
+                let hash = Md5::digest(data);
+                result[..16].copy_from_slice(&hash); // 16 bytes, rest zeros
+            }
+            HashAlgorithm::Ripemd160 => {
+                let hash = Ripemd160::digest(data);
+                result[..20].copy_from_slice(&hash); // 20 bytes, rest zeros
+            }
+        }
+        result
+    }
+
+    /// Perform multiple iterations of hashing
+    fn hash_iterations(&self, data: &[u8], iterations: u32) -> [u8; 32] {
+        let mut current = self.hash(data);
+        for _ in 1..iterations {
+            current = self.hash(&current);
+        }
+        current
+    }
+}
+
+/// Multi-hash configuration for brain wallet scanning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultiHashConfig {
+    /// Enable multi-hash iteration mode
+    enabled: bool,
+    /// Hash algorithms to try
+    algorithms: Vec<HashAlgorithm>,
+    /// Maximum number of iterations per algorithm
+    max_iterations: u32,
+}
+
+impl Default for MultiHashConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            algorithms: vec![HashAlgorithm::Sha256],
+            max_iterations: 1,
+        }
+    }
+}
 
 /// Progress checkpoint for resumable scanning
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +179,9 @@ struct ScanProgress {
     last_save_timestamp: u64,
     /// Whether variations mode is enabled
     with_variations: bool,
+    /// Multi-hash configuration
+    #[serde(default)]
+    multi_hash_config: MultiHashConfig,
 }
 
 impl ScanProgress {
@@ -167,6 +279,20 @@ enum Commands {
         /// Save progress every N seconds (default: 30)
         #[arg(long, default_value = "30")]
         save_interval: u64,
+
+        /// Enable multi-hash iteration mode (try multiple hash algorithms and iterations)
+        #[arg(long)]
+        multi_hash: bool,
+
+        /// Hash algorithms to try (comma-separated: sha256,sha512,sha1,md5,ripemd160)
+        /// Default: sha256 when --multi-hash is enabled
+        #[arg(long, value_delimiter = ',', default_value = "sha256")]
+        hash_algorithms: Vec<HashAlgorithm>,
+
+        /// Maximum number of consecutive hash iterations to try per algorithm
+        /// For each passphrase, will try hash(pass), hash(hash(pass)), etc. up to N times
+        #[arg(long, default_value = "1")]
+        max_iterations: u32,
     },
 
     /// Generate passphrases from a text file (split by sentences, phrases, etc.)
@@ -208,6 +334,14 @@ enum Commands {
         /// Electrs server address for balance queries (e.g., 192.168.1.19:50001)
         #[arg(long)]
         electrs: Option<String>,
+
+        /// Hash algorithm to use (sha256, sha512, sha1, md5, ripemd160)
+        #[arg(long, default_value = "sha256")]
+        hash_algorithm: HashAlgorithm,
+
+        /// Number of hash iterations (1 = single hash, 2 = hash(hash(pass)), etc.)
+        #[arg(long, default_value = "1")]
+        iterations: u32,
     },
 
     /// Import records from matches.txt into the known brain wallets database
@@ -562,14 +696,27 @@ fn derive_addresses(pubkey_bytes: &[u8; 33]) -> Result<BitcoinAddresses> {
 }
 
 /// Brain wallet derivation: passphrase -> private key -> public key -> HASH160
+/// Uses default SHA256 algorithm with single iteration (standard brain wallet)
+#[allow(dead_code)]
 fn derive_brain_wallet(passphrase: &str) -> Result<([u8; 32], [u8; 33], [u8; 20], BitcoinAddresses)> {
-    // Step 1: SHA256(passphrase) -> 32-byte private key
-    let private_key_bytes: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
+    derive_brain_wallet_with_hash(passphrase, HashAlgorithm::Sha256, 1)
+}
 
-    // Step 2: Derive public key using secp256k1
+/// Brain wallet derivation with configurable hash algorithm and iterations
+/// algorithm: The hash algorithm to use
+/// iterations: Number of times to apply the hash (1 = single hash, 2 = hash of hash, etc.)
+fn derive_brain_wallet_with_hash(
+    passphrase: &str,
+    algorithm: HashAlgorithm,
+    iterations: u32,
+) -> Result<([u8; 32], [u8; 33], [u8; 20], BitcoinAddresses)> {
+    // Step 1: Apply hash algorithm N times to get 32-byte private key
+    let private_key_bytes = algorithm.hash_iterations(passphrase.as_bytes(), iterations);
+
+    // Validate that this produces a valid secp256k1 private key
     let secp = Secp256k1::new();
     let secret_key = SecretKey::from_slice(&private_key_bytes)
-        .context("Failed to create secret key")?;
+        .context("Failed to create secret key (invalid private key from hash)")?;
     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
 
     // Step 3: Get compressed public key (33 bytes)
@@ -585,6 +732,23 @@ fn derive_brain_wallet(passphrase: &str) -> Result<([u8; 32], [u8; 33], [u8; 20]
     let addresses = derive_addresses(&pubkey_bytes)?;
 
     Ok((private_key_bytes, pubkey_bytes, hash160, addresses))
+}
+
+/// Hash derivation info for tracking which method was used to find a match
+#[derive(Clone, Debug)]
+struct HashDerivationInfo {
+    algorithm: HashAlgorithm,
+    iterations: u32,
+}
+
+impl HashDerivationInfo {
+    fn format(&self) -> String {
+        if self.iterations == 1 {
+            format!("{}(passphrase)", self.algorithm)
+        } else {
+            format!("{}^{}(passphrase)", self.algorithm, self.iterations)
+        }
+    }
 }
 
 /// Generate variations of a passphrase
@@ -711,6 +875,8 @@ struct MatchResult {
     addresses: BitcoinAddresses,
     record: PubkeyRecord,
     balances: Option<AllBalances>,
+    /// Hash derivation method used (algorithm and iterations)
+    derivation: Option<HashDerivationInfo>,
 }
 
 impl MatchResult {
@@ -724,9 +890,16 @@ impl MatchResult {
             String::new()
         };
 
+        let derivation_section = if let Some(ref derivation) = self.derivation {
+            format!("Hash Derivation: {}\n", derivation.format())
+        } else {
+            String::new()
+        };
+
         format!(
             "=== MATCH FOUND ===\n\
              Passphrase: {}\n\
+             {}\
              Private Key (hex): {}\n\
              Private Key (WIF): {}\n\
              Public Key: {}\n\
@@ -741,6 +914,7 @@ impl MatchResult {
              Pubkey Type: {:?}\n\
              ==================\n",
             self.passphrase,
+            derivation_section,
             hex::encode(self.private_key),
             private_key_to_wif(&self.private_key),
             hex::encode(self.public_key),
@@ -792,86 +966,109 @@ fn process_batch(
     known_skipped: &AtomicU64,
     new_matches: &AtomicU64,
     progress: &ProgressBar,
+    multi_hash_config: &MultiHashConfig,
 ) {
     batch.par_iter().for_each(|passphrase| {
-        // Derive brain wallet
-        match derive_brain_wallet(passphrase) {
-            Ok((privkey, pubkey, hash160, addresses)) => {
-                // Check if this is a known brain wallet (skip if already in database)
-                if let Some(ref known_db) = known_db {
-                    if known_db.read().unwrap().contains_bytes(&hash160) {
-                        known_skipped.fetch_add(1, Ordering::Relaxed);
-                        progress.inc(1);
-                        return;
-                    }
-                }
+        // Generate hash derivation combinations to try
+        let derivations: Vec<(HashAlgorithm, u32)> = if multi_hash_config.enabled {
+            // Try all combinations of algorithms and iterations
+            multi_hash_config
+                .algorithms
+                .iter()
+                .flat_map(|&algo| {
+                    (1..=multi_hash_config.max_iterations).map(move |iter| (algo, iter))
+                })
+                .collect()
+        } else {
+            // Standard mode: just SHA256 with 1 iteration
+            vec![(HashAlgorithm::Sha256, 1)]
+        };
 
-                let (bloom_hit, fp64_hit, record) = scanner.check(&hash160);
+        let derivations_count = derivations.len() as u64;
 
-                checked.fetch_add(1, Ordering::Relaxed);
-
-                if bloom_hit {
-                    bloom_hits.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if fp64_hit {
-                    fp64_hits.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if let Some(record) = record {
-                    // MATCH FOUND!
-                    matches_found.fetch_add(1, Ordering::Relaxed);
-
-                    let result = MatchResult {
-                        passphrase: passphrase.clone(),
-                        private_key: privkey,
-                        public_key: pubkey,
-                        hash160,
-                        addresses: addresses.clone(),
-                        record: record.clone(),
-                        balances: None, // Will be filled later if electrs is configured
-                    };
-
-                    // Add to known brain wallets database
+        for (algorithm, iterations) in derivations {
+            // Derive brain wallet with specified algorithm and iterations
+            match derive_brain_wallet_with_hash(passphrase, algorithm, iterations) {
+                Ok((privkey, pubkey, hash160, addresses)) => {
+                    // Check if this is a known brain wallet (skip if already in database)
                     if let Some(ref known_db) = known_db {
-                        let known_record = KnownBrainWalletsDb::create_record(
-                            passphrase.clone(),
-                            hex::encode(privkey),
-                            private_key_to_wif(&privkey),
-                            hex::encode(pubkey),
-                            hex::encode(hash160),
-                            addresses.p2pkh.clone(),
-                            addresses.p2wpkh.clone(),
-                            addresses.p2sh_p2wpkh.clone(),
-                            record.first_seen_height,
-                            format!("{:?}", record.pubkey_type),
-                        );
-
-                        if let Ok(mut db) = known_db.write() {
-                            if let Ok(true) = db.append_record(known_record) {
-                                new_matches.fetch_add(1, Ordering::Relaxed);
-                                log::debug!("Added new brain wallet to database: {}", hex::encode(hash160));
-                            }
+                        if known_db.read().unwrap().contains_bytes(&hash160) {
+                            known_skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
                     }
 
-                    // Print immediately (without balance for now)
-                    eprintln!("\n{}", result.format());
+                    let (bloom_hit, fp64_hit, record) = scanner.check(&hash160);
 
-                    // Store for later
-                    if electrum_client.is_some() {
-                        pending_matches.lock().unwrap().push(result);
-                    } else {
-                        results.lock().unwrap().push(result);
+                    checked.fetch_add(1, Ordering::Relaxed);
+
+                    if bloom_hit {
+                        bloom_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if fp64_hit {
+                        fp64_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if let Some(record) = record {
+                        // MATCH FOUND!
+                        matches_found.fetch_add(1, Ordering::Relaxed);
+
+                        let derivation_info = HashDerivationInfo { algorithm, iterations };
+
+                        let result = MatchResult {
+                            passphrase: passphrase.clone(),
+                            private_key: privkey,
+                            public_key: pubkey,
+                            hash160,
+                            addresses: addresses.clone(),
+                            record: record.clone(),
+                            balances: None, // Will be filled later if electrs is configured
+                            derivation: Some(derivation_info),
+                        };
+
+                        // Add to known brain wallets database
+                        if let Some(ref known_db) = known_db {
+                            let known_record = KnownBrainWalletsDb::create_record(
+                                passphrase.clone(),
+                                hex::encode(privkey),
+                                private_key_to_wif(&privkey),
+                                hex::encode(pubkey),
+                                hex::encode(hash160),
+                                addresses.p2pkh.clone(),
+                                addresses.p2wpkh.clone(),
+                                addresses.p2sh_p2wpkh.clone(),
+                                record.first_seen_height,
+                                format!("{:?}", record.pubkey_type),
+                            );
+
+                            if let Ok(mut db) = known_db.write() {
+                                if let Ok(true) = db.append_record(known_record) {
+                                    new_matches.fetch_add(1, Ordering::Relaxed);
+                                    log::debug!("Added new brain wallet to database: {}", hex::encode(hash160));
+                                }
+                            }
+                        }
+
+                        // Print immediately (without balance for now)
+                        eprintln!("\n{}", result.format());
+
+                        // Store for later
+                        if electrum_client.is_some() {
+                            pending_matches.lock().unwrap().push(result);
+                        } else {
+                            results.lock().unwrap().push(result);
+                        }
                     }
                 }
-            }
-            Err(_) => {
-                // Skip invalid passphrases (e.g., those that produce invalid private keys)
+                Err(_) => {
+                    // Skip invalid derivations (e.g., those that produce invalid private keys)
+                }
             }
         }
 
-        progress.inc(1);
+        // Increment progress by the number of derivations tried for this passphrase
+        progress.inc(derivations_count);
     });
 }
 
@@ -890,7 +1087,31 @@ fn run_scan(
     resume: bool,
     progress_file: PathBuf,
     save_interval: u64,
+    multi_hash: bool,
+    hash_algorithms: Vec<HashAlgorithm>,
+    max_iterations: u32,
 ) -> Result<()> {
+    // Build multi-hash config
+    let multi_hash_config = Arc::new(MultiHashConfig {
+        enabled: multi_hash,
+        algorithms: if hash_algorithms.is_empty() {
+            vec![HashAlgorithm::Sha256]
+        } else {
+            hash_algorithms.clone()
+        },
+        max_iterations: max_iterations.max(1),
+    });
+
+    if multi_hash_config.enabled {
+        let total_derivations = multi_hash_config.algorithms.len() * multi_hash_config.max_iterations as usize;
+        log::info!(
+            "Multi-hash mode enabled: {} algorithm(s) × {} iterations = {} derivations per passphrase",
+            multi_hash_config.algorithms.len(),
+            multi_hash_config.max_iterations,
+            total_derivations
+        );
+        log::info!("Algorithms: {:?}", multi_hash_config.algorithms);
+    }
     // Set thread count
     if let Some(t) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -935,6 +1156,26 @@ fn run_scan(
                 if progress.with_variations != with_variations {
                     log::error!("Variations mode doesn't match. Progress: {}, Current: {}", progress.with_variations, with_variations);
                     anyhow::bail!("Variations mode mismatch. Use same --with-variations setting or remove --resume");
+                }
+
+                // Verify multi-hash config matches
+                if progress.multi_hash_config.enabled != multi_hash {
+                    log::error!("Multi-hash mode doesn't match. Progress: {}, Current: {}", 
+                        progress.multi_hash_config.enabled, multi_hash);
+                    anyhow::bail!("Multi-hash mode mismatch. Use same --multi-hash setting or remove --resume");
+                }
+                if multi_hash {
+                    let saved_algos: Vec<_> = progress.multi_hash_config.algorithms.iter().map(|a| a.to_string()).collect();
+                    let current_algos: Vec<_> = hash_algorithms.iter().map(|a| a.to_string()).collect();
+                    if saved_algos != current_algos {
+                        log::error!("Hash algorithms don't match. Progress: {:?}, Current: {:?}", saved_algos, current_algos);
+                        anyhow::bail!("Hash algorithms mismatch. Use same --hash-algorithms setting or remove --resume");
+                    }
+                    if progress.multi_hash_config.max_iterations != max_iterations {
+                        log::error!("Max iterations don't match. Progress: {}, Current: {}", 
+                            progress.multi_hash_config.max_iterations, max_iterations);
+                        anyhow::bail!("Max iterations mismatch. Use same --max-iterations setting or remove --resume");
+                    }
                 }
 
                 start_file_index = progress.current_file_index;
@@ -1024,14 +1265,24 @@ fn run_scan(
         total_lines += reader.lines().count() as u64;
     }
     
+    // Calculate derivations per passphrase based on multi-hash config
+    let derivations_per_passphrase = if multi_hash_config.enabled {
+        multi_hash_config.algorithms.len() as u64 * multi_hash_config.max_iterations as u64
+    } else {
+        1u64
+    };
+
     // Estimate total with variations (rough estimate: ~15 variations per line)
-    let estimated_total = if with_variations {
+    // and multiply by derivations per passphrase for multi-hash mode
+    let estimated_passphrases = if with_variations {
         total_lines * 15
     } else {
         total_lines
     };
+    let estimated_total = estimated_passphrases * derivations_per_passphrase;
     
-    log::info!("Total lines: {}, estimated passphrases: {}", total_lines, estimated_total);
+    log::info!("Total lines: {}, estimated passphrases: {}, derivations per passphrase: {}, estimated total derivations: {}", 
+        total_lines, estimated_passphrases, derivations_per_passphrase, estimated_total);
 
     // Progress bar
     let progress = ProgressBar::new(estimated_total);
@@ -1043,6 +1294,7 @@ fn run_scan(
     );
 
     // Helper function to save progress checkpoint
+    let multi_hash_config_for_save = (*multi_hash_config).clone();
     let save_progress = |file_idx: usize, file_offset: u64, line_num: u64| -> Result<()> {
         let progress_data = ScanProgress {
             current_file_index: file_idx,
@@ -1061,6 +1313,7 @@ fn run_scan(
                 .unwrap()
                 .as_secs(),
             with_variations,
+            multi_hash_config: multi_hash_config_for_save.clone(),
         };
         progress_data.save(&progress_file)?;
         log::info!("Progress saved: file {}/{}, line {}, checked {}, matches {}",
@@ -1176,6 +1429,7 @@ fn run_scan(
                         &known_skipped,
                         &new_matches,
                         &progress,
+                        &multi_hash_config,
                     );
 
                     total_processed.fetch_add(batch_size_actual as u64, Ordering::Relaxed);
@@ -1226,6 +1480,7 @@ fn run_scan(
             &known_skipped,
             &new_matches,
             &progress,
+            &multi_hash_config,
         );
 
         total_processed.fetch_add(batch_size_actual as u64, Ordering::Relaxed);
@@ -1469,12 +1724,30 @@ fn run_generate(
     Ok(())
 }
 
-fn run_test(passphrase: String, data_dir: PathBuf, electrs_addr: Option<String>) -> Result<()> {
+fn run_test(
+    passphrase: String,
+    data_dir: PathBuf,
+    electrs_addr: Option<String>,
+    hash_algorithm: HashAlgorithm,
+    iterations: u32,
+) -> Result<()> {
     println!("Testing passphrase: \"{}\"", passphrase);
     println!();
 
-    // Derive brain wallet
-    let (privkey, pubkey, hash160, addresses) = derive_brain_wallet(&passphrase)?;
+    // Show derivation method
+    let derivation_info = HashDerivationInfo {
+        algorithm: hash_algorithm,
+        iterations,
+    };
+    println!("Derivation method: {}", derivation_info.format());
+    println!();
+
+    // Derive brain wallet with specified algorithm and iterations
+    let (privkey, pubkey, hash160, addresses) = derive_brain_wallet_with_hash(
+        &passphrase,
+        hash_algorithm,
+        iterations,
+    )?;
 
     println!("Private Key (hex): {}", hex::encode(privkey));
     println!("Private Key (WIF): {}", private_key_to_wif(&privkey));
@@ -1819,8 +2092,29 @@ fn main() -> Result<()> {
             resume,
             progress_file,
             save_interval,
+            multi_hash,
+            hash_algorithms,
+            max_iterations,
         } => {
-            run_scan(input, data_dir, output, threads, skip_bloom, with_variations, electrs, balance_output, known_db, no_known_db, batch_size, resume, progress_file, save_interval)?;
+            run_scan(
+                input,
+                data_dir,
+                output,
+                threads,
+                skip_bloom,
+                with_variations,
+                electrs,
+                balance_output,
+                known_db,
+                no_known_db,
+                batch_size,
+                resume,
+                progress_file,
+                save_interval,
+                multi_hash,
+                hash_algorithms,
+                max_iterations,
+            )?;
         }
         Commands::Generate {
             input,
@@ -1832,8 +2126,8 @@ fn main() -> Result<()> {
         } => {
             run_generate(input, output, min_len, max_len, word_combos, max_words)?;
         }
-        Commands::Test { passphrase, data_dir, electrs } => {
-            run_test(passphrase, data_dir, electrs)?;
+        Commands::Test { passphrase, data_dir, electrs, hash_algorithm, iterations } => {
+            run_test(passphrase, data_dir, electrs, hash_algorithm, iterations)?;
         }
         Commands::Import { input, database } => {
             run_import(input, database)?;
