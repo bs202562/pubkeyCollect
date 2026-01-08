@@ -61,6 +61,439 @@ pub enum HashAlgorithm {
     Ripemd160,
 }
 
+/// Genesis block seed source
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GenesisSeedSource {
+    /// Genesis block hash
+    Hash,
+    /// Satoshi's coinbase public key
+    Pubkey,
+    /// Genesis block merkle root
+    Merkle,
+    /// The "Chancellor" message in coinbase
+    Message,
+}
+
+/// Bitcoin Genesis Block Constants
+mod genesis {
+    /// Genesis block hash (little-endian as stored)
+    pub const BLOCK_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+    
+    /// Satoshi's coinbase public key (uncompressed, 65 bytes)
+    pub const COINBASE_PUBKEY: &str = "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f";
+    
+    /// Genesis block merkle root
+    pub const MERKLE_ROOT: &str = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+    
+    /// The famous "Chancellor" message in the coinbase
+    pub const CHANCELLOR_MESSAGE: &[u8] = b"The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
+}
+
+/// A step in the hash chain
+#[derive(Debug, Clone, Copy)]
+struct HashChainStep {
+    algorithm: HashAlgorithm,
+    iterations: u32,
+}
+
+/// Parsed hash chain pattern
+#[derive(Debug, Clone)]
+struct HashChainPattern {
+    steps: Vec<HashChainStep>,
+}
+
+impl HashChainPattern {
+    /// Parse a pattern string like "7m1s4m2s"
+    /// Algorithm codes: m=MD5, s=SHA256, h=SHA512, 1=SHA1, r=RIPEMD160
+    fn parse(pattern: &str) -> Result<Self, String> {
+        let mut steps = Vec::new();
+        let mut current_num = String::new();
+        
+        for ch in pattern.chars() {
+            if ch.is_ascii_digit() {
+                current_num.push(ch);
+            } else {
+                let iterations: u32 = if current_num.is_empty() {
+                    1
+                } else {
+                    current_num.parse().map_err(|_| format!("Invalid number: {}", current_num))?
+                };
+                
+                let algorithm = match ch.to_ascii_lowercase() {
+                    'm' => HashAlgorithm::Md5,
+                    's' => HashAlgorithm::Sha256,
+                    'h' => HashAlgorithm::Sha512,
+                    '1' => HashAlgorithm::Sha1,
+                    'r' => HashAlgorithm::Ripemd160,
+                    _ => return Err(format!("Unknown algorithm code: {}", ch)),
+                };
+                
+                if iterations > 0 {
+                    steps.push(HashChainStep { algorithm, iterations });
+                }
+                current_num.clear();
+            }
+        }
+        
+        if steps.is_empty() {
+            return Err("Empty pattern".to_string());
+        }
+        
+        Ok(Self { steps })
+    }
+    
+    /// Apply the hash chain to input data
+    fn apply(&self, input: &[u8]) -> [u8; 32] {
+        let mut current = [0u8; 32];
+        
+        // First step uses original input
+        if let Some(first) = self.steps.first() {
+            current = first.algorithm.hash_iterations(input, first.iterations);
+        }
+        
+        // Subsequent steps use previous result
+        for step in self.steps.iter().skip(1) {
+            current = step.algorithm.hash_iterations(&current, step.iterations);
+        }
+        
+        current
+    }
+    
+    /// Format the pattern for display
+    fn format(&self) -> String {
+        self.steps.iter()
+            .map(|s| {
+                let code = match s.algorithm {
+                    HashAlgorithm::Md5 => 'm',
+                    HashAlgorithm::Sha256 => 's',
+                    HashAlgorithm::Sha512 => 'h',
+                    HashAlgorithm::Sha1 => '1',
+                    HashAlgorithm::Ripemd160 => 'r',
+                };
+                format!("{}{}", s.iterations, code)
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+    
+    /// Format human-readable description
+    fn describe(&self) -> String {
+        self.steps.iter()
+            .map(|s| format!("{}×{}", s.iterations, s.algorithm))
+            .collect::<Vec<_>>()
+            .join(" → ")
+    }
+    
+    /// Total number of hash operations
+    fn total_iterations(&self) -> u32 {
+        self.steps.iter().map(|s| s.iterations).sum()
+    }
+}
+
+/// Generate hash chain patterns up to the specified limits
+fn generate_patterns(
+    max_total_iterations: u32,
+    max_step_iterations: u32,
+    max_chain_length: u32,
+) -> Vec<HashChainPattern> {
+    let algorithms = [
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Md5,
+        HashAlgorithm::Sha512,
+        HashAlgorithm::Sha1,
+        HashAlgorithm::Ripemd160,
+    ];
+    
+    let mut patterns = Vec::new();
+    
+    // Generate patterns recursively
+    fn recurse(
+        current: &mut Vec<HashChainStep>,
+        algorithms: &[HashAlgorithm],
+        max_total: u32,
+        max_step: u32,
+        max_len: u32,
+        patterns: &mut Vec<HashChainPattern>,
+    ) {
+        // Current total iterations
+        let current_total: u32 = current.iter().map(|s| s.iterations).sum();
+        
+        // If we have at least one step, add this pattern
+        if !current.is_empty() {
+            patterns.push(HashChainPattern { steps: current.clone() });
+        }
+        
+        // Check if we can add more steps
+        if current.len() >= max_len as usize {
+            return;
+        }
+        
+        // Try adding each algorithm
+        for &algo in algorithms {
+            // Skip if same as last algorithm (consecutive same algo should be combined)
+            if let Some(last) = current.last() {
+                if last.algorithm == algo {
+                    continue;
+                }
+            }
+            
+            // Try different iteration counts
+            for iter in 1..=max_step {
+                if current_total + iter > max_total {
+                    break;
+                }
+                
+                current.push(HashChainStep { algorithm: algo, iterations: iter });
+                recurse(current, algorithms, max_total, max_step, max_len, patterns);
+                current.pop();
+            }
+        }
+    }
+    
+    let mut current = Vec::new();
+    recurse(&mut current, &algorithms, max_total_iterations, max_step_iterations, max_chain_length, &mut patterns);
+    
+    patterns
+}
+
+/// Numeric pattern mode - interpret a number sequence as alternating hash iterations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NumericPatternMode {
+    /// Alternate between MD5 and SHA256 (e.g., 714285 = 7×MD5, 1×SHA256, 4×MD5, 2×SHA256, 8×MD5, 5×SHA256)
+    MdSha,
+    /// Alternate between SHA256 and MD5 (e.g., 714285 = 7×SHA256, 1×MD5, 4×SHA256, ...)
+    ShaMd,
+    /// Cycle through all algorithms: SHA256, MD5, SHA512, SHA1, RIPEMD160
+    AllCycle,
+}
+
+/// Convert a numeric string to a hash chain pattern
+fn numeric_to_pattern(number: &str, mode: NumericPatternMode) -> Option<HashChainPattern> {
+    let digits: Vec<u32> = number.chars()
+        .filter_map(|c| c.to_digit(10))
+        .collect();
+    
+    if digits.is_empty() {
+        return None;
+    }
+    
+    let algorithms: Vec<HashAlgorithm> = match mode {
+        NumericPatternMode::MdSha => vec![HashAlgorithm::Md5, HashAlgorithm::Sha256],
+        NumericPatternMode::ShaMd => vec![HashAlgorithm::Sha256, HashAlgorithm::Md5],
+        NumericPatternMode::AllCycle => vec![
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Ripemd160,
+        ],
+    };
+    
+    let mut steps = Vec::new();
+    for (i, &digit) in digits.iter().enumerate() {
+        if digit == 0 {
+            continue; // Skip zero iterations
+        }
+        let algo = algorithms[i % algorithms.len()];
+        steps.push(HashChainStep {
+            algorithm: algo,
+            iterations: digit,
+        });
+    }
+    
+    if steps.is_empty() {
+        return None;
+    }
+    
+    Some(HashChainPattern { steps })
+}
+
+/// Generate all N-digit numeric patterns (0000 to 9999 for 4 digits)
+fn generate_numeric_patterns(num_digits: u32, mode: NumericPatternMode) -> Vec<(String, HashChainPattern)> {
+    let mut patterns = Vec::new();
+    let max_value = 10u32.pow(num_digits);
+    
+    for n in 0..max_value {
+        let num_str = format!("{:0width$}", n, width = num_digits as usize);
+        if let Some(pattern) = numeric_to_pattern(&num_str, mode) {
+            patterns.push((num_str, pattern));
+        }
+    }
+    
+    patterns
+}
+
+/// Get a list of meaningful/special numbers
+fn get_meaningful_numbers() -> Vec<(&'static str, &'static str)> {
+    vec![
+        // Repeating digits
+        ("0", "zero"),
+        ("1", "one"),
+        ("11", "eleven"),
+        ("111", "triple one"),
+        ("1111", "quad one"),
+        ("11111", "quint one"),
+        ("111111", "six ones"),
+        ("1111111", "seven ones"),
+        ("11111111", "eight ones"),
+        ("22", "twenty two"),
+        ("222", "triple two"),
+        ("2222", "quad two"),
+        ("33", "thirty three"),
+        ("333", "triple three"),
+        ("3333", "quad three"),
+        ("44", "forty four"),
+        ("444", "triple four"),
+        ("4444", "quad four"),
+        ("55", "fifty five"),
+        ("555", "triple five"),
+        ("5555", "quad five"),
+        ("66", "sixty six"),
+        ("666", "triple six"),
+        ("6666", "quad six"),
+        ("77", "seventy seven"),
+        ("777", "triple seven"),
+        ("7777", "quad seven"),
+        ("88", "eighty eight"),
+        ("888", "triple eight"),
+        ("8888", "quad eight"),
+        ("99", "ninety nine"),
+        ("999", "triple nine"),
+        ("9999", "quad nine"),
+        
+        // Sequential
+        ("12", "one-two"),
+        ("123", "one-two-three"),
+        ("1234", "one-two-three-four"),
+        ("12345", "one to five"),
+        ("123456", "one to six"),
+        ("1234567", "one to seven"),
+        ("12345678", "one to eight"),
+        ("123456789", "one to nine"),
+        ("1234567890", "one to zero"),
+        ("21", "two-one"),
+        ("321", "three-two-one"),
+        ("4321", "four-three-two-one"),
+        ("54321", "five to one"),
+        ("654321", "six to one"),
+        ("7654321", "seven to one"),
+        ("87654321", "eight to one"),
+        ("987654321", "nine to one"),
+        ("9876543210", "nine to zero"),
+        
+        // Repeating fractions
+        ("142857", "1/7 repeating"),
+        ("285714", "2/7 repeating"),
+        ("428571", "3/7 repeating"),
+        ("571428", "4/7 repeating"),
+        ("714285", "5/7 repeating"),
+        ("857142", "6/7 repeating"),
+        ("076923", "1/13 repeating"),
+        ("153846", "2/13 repeating"),
+        ("09", "1/11 approx"),
+        ("18", "2/11 approx"),
+        ("27", "3/11 approx"),
+        ("36", "4/11 approx"),
+        ("45", "5/11 approx"),
+        ("54", "6/11 approx"),
+        ("63", "7/11 approx"),
+        ("72", "8/11 approx"),
+        ("81", "9/11 approx"),
+        
+        // Famous constants (digits)
+        ("314159", "pi"),
+        ("31415926", "pi extended"),
+        ("3141592653", "pi more"),
+        ("271828", "e"),
+        ("27182818", "e extended"),
+        ("141421", "sqrt(2)"),
+        ("1414213562", "sqrt(2) more"),
+        ("173205", "sqrt(3)"),
+        ("161803", "golden ratio"),
+        ("1618033988", "golden ratio more"),
+        
+        // Bitcoin-related
+        ("21", "21 million"),
+        ("21000000", "max bitcoin"),
+        ("2100000000000000", "max satoshi"),
+        ("100000000", "satoshi per btc"),
+        ("2009", "bitcoin year"),
+        ("3", "jan 3"),
+        ("32009", "3/jan/2009"),
+        ("312009", "3/1/2009"),
+        ("1231006505", "genesis timestamp"),
+        ("486604799", "genesis nBits"),
+        ("2083236893", "genesis nonce"),
+        
+        // Powers
+        ("2", "2^1"),
+        ("4", "2^2"),
+        ("8", "2^3"),
+        ("16", "2^4"),
+        ("32", "2^5"),
+        ("64", "2^6"),
+        ("128", "2^7"),
+        ("256", "2^8"),
+        ("512", "2^9"),
+        ("1024", "2^10"),
+        ("2048", "2^11"),
+        ("4096", "2^12"),
+        ("8192", "2^13"),
+        ("16384", "2^14"),
+        ("32768", "2^15"),
+        ("65536", "2^16"),
+        
+        // Fibonacci
+        ("112358", "fibonacci"),
+        ("11235813", "fibonacci ext"),
+        ("1123581321", "fibonacci more"),
+        ("1123581321345589", "fibonacci long"),
+        
+        // Prime numbers
+        ("2357", "first 4 primes"),
+        ("235711", "first 5 primes"),
+        ("23571113", "first 6 primes"),
+        ("2357111317", "first 7 primes"),
+        
+        // Other meaningful
+        ("42", "answer to everything"),
+        ("69", "nice"),
+        ("420", "blaze"),
+        ("1337", "leet"),
+        ("31337", "elite"),
+        ("8008", "boob"),
+        ("80085", "boobs"),
+        ("5318008", "boobies upside down"),
+        ("0451", "fahrenheit 451"),
+        ("1984", "orwell"),
+        ("2001", "space odyssey"),
+        ("404", "not found"),
+        ("500", "server error"),
+        ("007", "bond"),
+        ("13", "unlucky"),
+        ("7", "lucky"),
+        ("777", "jackpot"),
+        ("666", "devil"),
+        ("911", "emergency"),
+        ("112", "eu emergency"),
+        ("999", "uk emergency"),
+    ]
+}
+
+/// Generate patterns from meaningful numbers
+fn generate_meaningful_patterns(mode: NumericPatternMode) -> Vec<(String, String, HashChainPattern)> {
+    let meaningful = get_meaningful_numbers();
+    let mut patterns = Vec::new();
+    
+    for (number, description) in meaningful {
+        if let Some(pattern) = numeric_to_pattern(number, mode) {
+            patterns.push((number.to_string(), description.to_string(), pattern));
+        }
+    }
+    
+    patterns
+}
+
 impl fmt::Display for HashAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -390,6 +823,114 @@ enum Commands {
         /// Output format: json, csv, txt
         #[arg(short, long, default_value = "txt")]
         format: String,
+    },
+
+    /// Scan using Genesis block data as seed with chain hash patterns
+    /// 
+    /// This mode uses Bitcoin genesis block hash or pubkey as seed,
+    /// then applies a chain of hash operations to generate candidate private keys.
+    /// 
+    /// Numeric pattern: "714285" means 7×algo1, 1×algo2, 4×algo1, 2×algo2, 8×algo1, 5×algo2
+    Genesis {
+        /// Directory containing the public key database
+        #[arg(short, long, default_value = "output")]
+        data_dir: PathBuf,
+
+        /// Output file for found matches
+        #[arg(short, long, default_value = "matches.txt")]
+        output: PathBuf,
+
+        /// Seed source: "hash" (genesis block hash) or "pubkey" (satoshi's pubkey)
+        #[arg(long, default_value = "hash")]
+        seed: GenesisSeedSource,
+
+        /// Use numeric patterns mode: enumerate all N-digit numbers as hash iteration patterns
+        /// Each digit represents iterations for alternating algorithms
+        #[arg(long)]
+        numeric_digits: Option<u32>,
+
+        /// Algorithm alternation mode for numeric patterns
+        #[arg(long, default_value = "md-sha")]
+        numeric_mode: NumericPatternMode,
+
+        /// Include meaningful numbers (pi, fibonacci, bitcoin-related, etc.)
+        #[arg(long)]
+        meaningful_numbers: bool,
+
+        /// Skip Bloom filter (use FP64 only for faster loading)
+        #[arg(long)]
+        skip_bloom: bool,
+
+        /// Electrs server address for balance queries
+        #[arg(long)]
+        electrs: Option<String>,
+
+        /// Path to known brain wallets database
+        #[arg(long, default_value = "known_brainwallets.jsonl")]
+        known_db: PathBuf,
+
+        /// Disable known brain wallets tracking
+        #[arg(long)]
+        no_known_db: bool,
+
+        /// Number of threads to use
+        #[arg(short, long)]
+        threads: Option<usize>,
+
+        /// Also try hex encoding of seed before hashing
+        #[arg(long)]
+        try_hex_encoding: bool,
+
+        /// Also try reversed bytes of seed
+        #[arg(long)]
+        try_reversed: bool,
+
+        /// Try all seed sources (hash, pubkey, merkle, message)
+        #[arg(long)]
+        all_seeds: bool,
+    },
+
+    /// Iterate known brain wallets with repeated SHA256 hashing
+    /// 
+    /// This mode takes each known brain wallet's private key and applies
+    /// SHA256 repeatedly (1 to N times), checking if any derived public key
+    /// exists in the database and querying balances.
+    IterateKnown {
+        /// Directory containing the public key database
+        #[arg(short, long, default_value = "output")]
+        data_dir: PathBuf,
+
+        /// Output file for found matches
+        #[arg(short, long, default_value = "iterate_matches.txt")]
+        output: PathBuf,
+
+        /// Path to known brain wallets database
+        #[arg(long, default_value = "known_brainwallets.jsonl")]
+        known_db: PathBuf,
+
+        /// Maximum number of SHA256 iterations to try (e.g., 1000)
+        #[arg(long, default_value = "1000")]
+        max_iterations: u32,
+
+        /// Skip Bloom filter (use FP64 only for faster loading)
+        #[arg(long)]
+        skip_bloom: bool,
+
+        /// Electrs server address for balance queries (e.g., 192.168.1.19:50001)
+        #[arg(long)]
+        electrs: Option<String>,
+
+        /// Output file for matches with balance (only used with --electrs)
+        #[arg(long, default_value = "iterate_matches_with_balance.txt")]
+        balance_output: PathBuf,
+
+        /// Number of threads to use (default: number of CPUs)
+        #[arg(short, long)]
+        threads: Option<usize>,
+
+        /// Only query balances (skip database lookup, useful when database is not available)
+        #[arg(long)]
+        balance_only: bool,
     },
 }
 
@@ -2000,6 +2541,349 @@ fn run_stats(database_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Scan using Genesis block data as seed with chain hash patterns
+fn run_genesis(
+    data_dir: PathBuf,
+    output_path: PathBuf,
+    seed_source: GenesisSeedSource,
+    numeric_digits: Option<u32>,
+    numeric_mode: NumericPatternMode,
+    meaningful_numbers: bool,
+    skip_bloom: bool,
+    electrs_addr: Option<String>,
+    known_db_path: PathBuf,
+    no_known_db: bool,
+    threads: Option<usize>,
+    try_hex_encoding: bool,
+    try_reversed: bool,
+    all_seeds: bool,
+) -> Result<()> {
+    log::info!("=== Genesis Block Hash Chain Scanner ===");
+    
+    // Set thread count
+    if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build_global()
+            .ok();
+    }
+    
+    // Prepare all seed sources
+    let seed_sources: Vec<GenesisSeedSource> = if all_seeds {
+        vec![
+            GenesisSeedSource::Hash,
+            GenesisSeedSource::Pubkey,
+            GenesisSeedSource::Merkle,
+            GenesisSeedSource::Message,
+        ]
+    } else {
+        vec![seed_source]
+    };
+    
+    // Collect all seeds with their variants
+    let mut all_seeds_data: Vec<(String, String, Vec<u8>)> = Vec::new(); // (source_name, variant_name, data)
+    
+    for src in &seed_sources {
+        let source_name = match src {
+            GenesisSeedSource::Hash => "hash",
+            GenesisSeedSource::Pubkey => "pubkey",
+            GenesisSeedSource::Merkle => "merkle",
+            GenesisSeedSource::Message => "message",
+        };
+        
+        let seed_hex = match src {
+            GenesisSeedSource::Hash => genesis::BLOCK_HASH,
+            GenesisSeedSource::Pubkey => genesis::COINBASE_PUBKEY,
+            GenesisSeedSource::Merkle => genesis::MERKLE_ROOT,
+            GenesisSeedSource::Message => "",
+        };
+        
+        let seed_bytes: Vec<u8> = if *src == GenesisSeedSource::Message {
+            genesis::CHANCELLOR_MESSAGE.to_vec()
+        } else {
+            hex::decode(seed_hex).context("Failed to decode seed hex")?
+        };
+        
+        // Add raw bytes
+        all_seeds_data.push((source_name.to_string(), "raw".to_string(), seed_bytes.clone()));
+        
+        // Add hex string variant
+        if try_hex_encoding && *src != GenesisSeedSource::Message {
+            all_seeds_data.push((source_name.to_string(), "hex_str".to_string(), seed_hex.as_bytes().to_vec()));
+        }
+        
+        // Add reversed bytes variant
+        if try_reversed {
+            let mut reversed = seed_bytes.clone();
+            reversed.reverse();
+            all_seeds_data.push((source_name.to_string(), "reversed".to_string(), reversed));
+        }
+    }
+    
+    log::info!("Seed sources: {} (with {} total variants)", seed_sources.len(), all_seeds_data.len());
+    for (source, variant, data) in &all_seeds_data {
+        log::info!("  - {}:{} ({} bytes)", source, variant, data.len());
+    }
+    
+    // Generate patterns based on mode
+    let mode_name = match numeric_mode {
+        NumericPatternMode::MdSha => "MD5/SHA256 alternating",
+        NumericPatternMode::ShaMd => "SHA256/MD5 alternating",
+        NumericPatternMode::AllCycle => "All algorithms cycling",
+    };
+    log::info!("Numeric mode: {}", mode_name);
+    
+    // Collect all patterns: (number_str, description, pattern)
+    let mut all_patterns: Vec<(String, String, HashChainPattern)> = Vec::new();
+    
+    // Add numeric digit patterns (0000-9999 for 4 digits, etc.)
+    if let Some(digits) = numeric_digits {
+        log::info!("Generating all {}-digit numeric patterns...", digits);
+        let numeric_patterns = generate_numeric_patterns(digits, numeric_mode);
+        log::info!("Generated {} {}-digit patterns", numeric_patterns.len(), digits);
+        for (num, pattern) in numeric_patterns {
+            all_patterns.push((num.clone(), format!("{}-digit", digits), pattern));
+        }
+    }
+    
+    // Add meaningful numbers
+    if meaningful_numbers {
+        log::info!("Adding meaningful number patterns...");
+        let meaningful_patterns = generate_meaningful_patterns(numeric_mode);
+        log::info!("Added {} meaningful number patterns", meaningful_patterns.len());
+        for (num, desc, pattern) in meaningful_patterns {
+            // Avoid duplicates
+            if !all_patterns.iter().any(|(n, _, _)| n == &num) {
+                all_patterns.push((num, desc, pattern));
+            }
+        }
+    }
+    
+    // If no patterns specified, use meaningful numbers by default
+    if all_patterns.is_empty() {
+        log::info!("No patterns specified, using meaningful numbers by default...");
+        let meaningful_patterns = generate_meaningful_patterns(numeric_mode);
+        log::info!("Using {} meaningful number patterns", meaningful_patterns.len());
+        for (num, desc, pattern) in meaningful_patterns {
+            all_patterns.push((num, desc, pattern));
+        }
+    }
+    
+    // Calculate total candidates
+    let total_candidates = all_seeds_data.len() * all_patterns.len();
+    log::info!("Total candidates to check: {} seeds × {} patterns = {}",
+        all_seeds_data.len(), all_patterns.len(), total_candidates);
+    
+    // Load known brain wallets database
+    let known_db = if !no_known_db {
+        log::info!("Loading known brain wallets database from {:?}...", known_db_path);
+        let db = KnownBrainWalletsDb::open(&known_db_path)?;
+        log::info!("Loaded {} known brain wallet records", db.len());
+        Some(Arc::new(RwLock::new(db)))
+    } else {
+        None
+    };
+    
+    // Load scanner
+    let scanner = Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?);
+    
+    // Electrs client (if configured)
+    let electrum_client = electrs_addr.as_ref().map(|addr| {
+        log::info!("Electrs server configured: {}", addr);
+        Arc::new(ElectrumClient::new(addr))
+    });
+    
+    // Results
+    let results: Arc<Mutex<Vec<MatchResult>>> = Arc::new(Mutex::new(Vec::new()));
+    
+    // Counters
+    let checked = AtomicU64::new(0);
+    let matches_found = AtomicU64::new(0);
+    let bloom_hits = AtomicU64::new(0);
+    let fp64_hits = AtomicU64::new(0);
+    
+    // Progress bar
+    let progress = ProgressBar::new(total_candidates as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
+    let start = Instant::now();
+    let secp = Secp256k1::new();
+    
+    // Process all combinations
+    for (source_name, variant_name, seed_data) in &all_seeds_data {
+        for (num_str, num_desc, pattern) in &all_patterns {
+            // Apply hash chain
+            let private_key_bytes = pattern.apply(seed_data);
+            
+            // Validate and derive public key
+            match SecretKey::from_slice(&private_key_bytes) {
+                Ok(secret_key) => {
+                    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+                    let pubkey_bytes = public_key.serialize();
+                    
+                    // Compute HASH160
+                    let sha256_hash = Sha256::digest(&pubkey_bytes);
+                    let ripemd_hash = Ripemd160::digest(&sha256_hash);
+                    let mut hash160 = [0u8; 20];
+                    hash160.copy_from_slice(&ripemd_hash);
+                    
+                    // Check if known
+                    if let Some(ref db) = known_db {
+                        if db.read().unwrap().contains_bytes(&hash160) {
+                            checked.fetch_add(1, Ordering::Relaxed);
+                            progress.inc(1);
+                            continue;
+                        }
+                    }
+                    
+                    // Check in database
+                    let (bloom_hit, fp64_hit, record) = scanner.check(&hash160);
+                    
+                    checked.fetch_add(1, Ordering::Relaxed);
+                    
+                    if bloom_hit {
+                        bloom_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if fp64_hit {
+                        fp64_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    
+                    if let Some(record) = record {
+                        // MATCH FOUND!
+                        matches_found.fetch_add(1, Ordering::Relaxed);
+                        
+                        // Derive addresses
+                        let addresses = derive_addresses(&pubkey_bytes)?;
+                        
+                        // Create passphrase description
+                        let passphrase_desc = format!(
+                            "genesis:{}:{}:num[{}]",
+                            source_name,
+                            variant_name,
+                            num_str
+                        );
+                        
+                        let derivation_desc = format!(
+                            "{}:{} + numeric \"{}\" ({}) = {}",
+                            source_name,
+                            variant_name,
+                            num_str,
+                            num_desc,
+                            pattern.describe()
+                        );
+                        
+                        log::info!("\n🎉 MATCH FOUND!");
+                        log::info!("Seed: {}:{}", source_name, variant_name);
+                        log::info!("Numeric pattern: {} ({})", num_str, num_desc);
+                        log::info!("Hash chain: {}", pattern.describe());
+                        log::info!("Private Key: {}", hex::encode(private_key_bytes));
+                        log::info!("HASH160: {}", hex::encode(hash160));
+                        
+                        let result = MatchResult {
+                            passphrase: passphrase_desc.clone(),
+                            private_key: private_key_bytes,
+                            public_key: pubkey_bytes,
+                            hash160,
+                            addresses: addresses.clone(),
+                            record: record.clone(),
+                            balances: None,
+                            derivation: None,
+                        };
+                        
+                        // Print immediately
+                        eprintln!("\n{}", result.format());
+                        eprintln!("Derivation: {}", derivation_desc);
+                        
+                        // Add to known database
+                        if let Some(ref db) = known_db {
+                            let known_record = KnownBrainWalletsDb::create_record(
+                                passphrase_desc,
+                                hex::encode(private_key_bytes),
+                                private_key_to_wif(&private_key_bytes),
+                                hex::encode(pubkey_bytes),
+                                hex::encode(hash160),
+                                addresses.p2pkh.clone(),
+                                addresses.p2wpkh.clone(),
+                                addresses.p2sh_p2wpkh.clone(),
+                                record.first_seen_height,
+                                format!("{:?}", record.pubkey_type),
+                            );
+                            
+                            if let Ok(mut db_write) = db.write() {
+                                let _ = db_write.append_record(known_record);
+                            }
+                        }
+                        
+                        results.lock().unwrap().push(result);
+                    }
+                }
+                Err(_) => {
+                    // Invalid private key (outside secp256k1 curve order)
+                }
+            }
+            
+            progress.inc(1);
+        }
+    }
+    
+    progress.finish();
+    
+    let elapsed = start.elapsed();
+    let total_checked = checked.load(Ordering::Relaxed);
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        total_checked as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    
+    log::info!("=== Genesis Scan Complete ===");
+    log::info!("Total checked: {}", total_checked);
+    log::info!("Bloom hits: {}", bloom_hits.load(Ordering::Relaxed));
+    log::info!("FP64 hits: {}", fp64_hits.load(Ordering::Relaxed));
+    log::info!("Matches found: {}", matches_found.load(Ordering::Relaxed));
+    log::info!("Time elapsed: {:?}", elapsed);
+    log::info!("Rate: {:.2} candidates/sec", rate);
+    
+    // Query balances if electrs is configured
+    let mut final_results = results.lock().unwrap().clone();
+    
+    if let Some(ref client) = electrum_client {
+        if !final_results.is_empty() {
+            log::info!("Querying balances for {} matches...", final_results.len());
+            
+            let rt = tokio::runtime::Runtime::new()?;
+            for result in &mut final_results {
+                let balance = rt.block_on(client.get_all_balances(&result.hash160));
+                if balance.has_balance() {
+                    eprintln!("\n🎉 MATCH WITH BALANCE:");
+                    eprintln!("{}", result.format());
+                    eprintln!("Balances:\n{}", balance.format());
+                }
+                result.balances = Some(balance);
+            }
+        }
+    }
+    
+    // Write results
+    if !final_results.is_empty() {
+        let file = File::create(&output_path)?;
+        let mut writer = BufWriter::new(file);
+        
+        for result in &final_results {
+            writeln!(writer, "{}", result.format())?;
+        }
+        
+        log::info!("Results written to {:?}", output_path);
+    }
+    
+    Ok(())
+}
+
 /// Export known brain wallets to a file
 fn run_export(database_path: PathBuf, output_path: PathBuf, format: String) -> Result<()> {
     let db = KnownBrainWalletsDb::open(&database_path)?;
@@ -2066,6 +2950,318 @@ fn run_export(database_path: PathBuf, output_path: PathBuf, format: String) -> R
     log::info!("Export complete.");
 
     Ok(())
+}
+
+/// Iterate known brain wallets with repeated SHA256 hashing
+/// Each known brain wallet's private key is hashed N times, and each intermediate
+/// result is checked against the database and queried for balance.
+fn run_iterate_known(
+    data_dir: PathBuf,
+    output_path: PathBuf,
+    known_db_path: PathBuf,
+    max_iterations: u32,
+    skip_bloom: bool,
+    electrs_addr: Option<String>,
+    balance_output_path: PathBuf,
+    threads: Option<usize>,
+    balance_only: bool,
+) -> Result<()> {
+    log::info!("=== Iterate Known Brain Wallets with Repeated SHA256 ===");
+    log::info!("Max iterations per wallet: {}", max_iterations);
+    
+    // Set thread count
+    if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build_global()
+            .ok();
+    }
+    
+    // Load known brain wallets database
+    log::info!("Loading known brain wallets database from {:?}...", known_db_path);
+    let known_db = KnownBrainWalletsDb::open(&known_db_path)?;
+    
+    if known_db.is_empty() {
+        log::warn!("No known brain wallets found. Nothing to iterate.");
+        return Ok(());
+    }
+    
+    log::info!("Loaded {} known brain wallet records", known_db.len());
+    
+    // Collect all known wallets
+    let known_wallets: Vec<_> = known_db.all_records().cloned().collect();
+    
+    // Load scanner (unless balance_only mode)
+    let scanner = if !balance_only {
+        log::info!("Loading public key database from {:?}...", data_dir);
+        Some(Arc::new(CollisionScanner::new(&data_dir, skip_bloom)?))
+    } else {
+        log::info!("Balance-only mode: skipping database load");
+        None
+    };
+    
+    // Electrs client (if configured)
+    let electrum_client = electrs_addr.as_ref().map(|addr| {
+        log::info!("Electrs server configured: {}", addr);
+        Arc::new(ElectrumClient::new(addr))
+    });
+    
+    if electrum_client.is_none() && balance_only {
+        log::warn!("Balance-only mode requires --electrs to be set!");
+        return Ok(());
+    }
+    
+    // Results
+    let results: Arc<Mutex<Vec<IterateMatchResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let balance_results: Arc<Mutex<Vec<IterateMatchResult>>> = Arc::new(Mutex::new(Vec::new()));
+    
+    // Counters
+    let total_checked = AtomicU64::new(0);
+    let matches_found = AtomicU64::new(0);
+    let balance_found = AtomicU64::new(0);
+    let bloom_hits = AtomicU64::new(0);
+    let fp64_hits = AtomicU64::new(0);
+    
+    // Total candidates
+    let total_candidates = known_wallets.len() as u64 * max_iterations as u64;
+    log::info!("Total candidates to check: {} wallets × {} iterations = {}", 
+        known_wallets.len(), max_iterations, total_candidates);
+    
+    // Progress bar
+    let progress = ProgressBar::new(total_candidates);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
+    let start = Instant::now();
+    let secp = Secp256k1::new();
+    
+    // Process each known wallet
+    for wallet in &known_wallets {
+        // Parse the original private key
+        let original_privkey = match hex::decode(&wallet.private_key_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            _ => {
+                log::warn!("Invalid private key for passphrase '{}', skipping", wallet.passphrase);
+                progress.inc(max_iterations as u64);
+                continue;
+            }
+        };
+        
+        // Start with the original private key
+        let mut current_key = original_privkey;
+        
+        for iteration in 1..=max_iterations {
+            // Apply SHA256 to current key
+            let hash = Sha256::digest(&current_key);
+            current_key.copy_from_slice(&hash);
+            
+            // Validate and derive public key
+            match SecretKey::from_slice(&current_key) {
+                Ok(secret_key) => {
+                    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+                    let pubkey_bytes = public_key.serialize();
+                    
+                    // Compute HASH160
+                    let sha256_hash = Sha256::digest(&pubkey_bytes);
+                    let ripemd_hash = Ripemd160::digest(&sha256_hash);
+                    let mut hash160 = [0u8; 20];
+                    hash160.copy_from_slice(&ripemd_hash);
+                    
+                    total_checked.fetch_add(1, Ordering::Relaxed);
+                    
+                    // Derive addresses
+                    let addresses = match derive_addresses(&pubkey_bytes) {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            progress.inc(1);
+                            continue;
+                        }
+                    };
+                    
+                    let mut db_match = false;
+                    let mut record_info: Option<PubkeyRecord> = None;
+                    
+                    // Check in database (unless balance_only mode)
+                    if let Some(ref scanner) = scanner {
+                        let (bloom_hit, fp64_hit, record) = scanner.check(&hash160);
+                        
+                        if bloom_hit {
+                            bloom_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if fp64_hit {
+                            fp64_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        
+                        if let Some(rec) = record {
+                            db_match = true;
+                            record_info = Some(rec);
+                            matches_found.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    
+                    // Query balance if electrs is configured
+                    let mut has_balance = false;
+                    let mut balances: Option<AllBalances> = None;
+                    
+                    if let Some(ref client) = electrum_client {
+                        let rt = tokio::runtime::Runtime::new()?;
+                        let balance = rt.block_on(client.get_all_balances(&hash160));
+                        has_balance = balance.has_balance();
+                        balances = Some(balance);
+                    }
+                    
+                    // Report if match found or has balance
+                    if db_match || has_balance {
+                        let result = IterateMatchResult {
+                            original_passphrase: wallet.passphrase.clone(),
+                            original_privkey_hex: wallet.private_key_hex.clone(),
+                            iteration,
+                            derived_privkey: current_key,
+                            derived_pubkey: pubkey_bytes,
+                            derived_hash160: hash160,
+                            addresses: addresses.clone(),
+                            db_record: record_info.clone(),
+                            balances: balances.clone(),
+                        };
+                        
+                        if db_match {
+                            log::info!("\n🎉 DATABASE MATCH at iteration {}!", iteration);
+                            log::info!("Original passphrase: {}", wallet.passphrase);
+                            log::info!("SHA256^{} of original privkey", iteration);
+                            log::info!("Derived Private Key: {}", hex::encode(current_key));
+                            log::info!("HASH160: {}", hex::encode(hash160));
+                            
+                            eprintln!("\n{}", result.format());
+                            results.lock().unwrap().push(result.clone());
+                        }
+                        
+                        if has_balance {
+                            balance_found.fetch_add(1, Ordering::Relaxed);
+                            log::info!("\n💰 BALANCE FOUND at iteration {}!", iteration);
+                            log::info!("Original passphrase: {}", wallet.passphrase);
+                            log::info!("Addresses: P2PKH={}, P2WPKH={}", addresses.p2pkh, addresses.p2wpkh);
+                            if let Some(ref bal) = balances {
+                                log::info!("Total: {} BTC", bal.total_btc());
+                            }
+                            
+                            eprintln!("\n{}", result.format());
+                            balance_results.lock().unwrap().push(result);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Invalid private key (outside secp256k1 curve order), skip
+                }
+            }
+            
+            progress.inc(1);
+        }
+    }
+    
+    progress.finish();
+    
+    let elapsed = start.elapsed();
+    let checked = total_checked.load(Ordering::Relaxed);
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        checked as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    
+    log::info!("\n=== Iterate Scan Complete ===");
+    log::info!("Total checked: {}", checked);
+    if !balance_only {
+        log::info!("Bloom hits: {}", bloom_hits.load(Ordering::Relaxed));
+        log::info!("FP64 hits: {}", fp64_hits.load(Ordering::Relaxed));
+        log::info!("Database matches found: {}", matches_found.load(Ordering::Relaxed));
+    }
+    log::info!("Balances found: {}", balance_found.load(Ordering::Relaxed));
+    log::info!("Time elapsed: {:?}", elapsed);
+    log::info!("Rate: {:.2} candidates/sec", rate);
+    
+    // Write results
+    let final_results = results.lock().unwrap();
+    if !final_results.is_empty() {
+        let file = File::create(&output_path)?;
+        let mut writer = BufWriter::new(file);
+        
+        for result in final_results.iter() {
+            writeln!(writer, "{}", result.format())?;
+        }
+        
+        writer.flush()?;
+        log::info!("Database matches written to {:?}", output_path);
+    }
+    
+    // Write balance results
+    let final_balance_results = balance_results.lock().unwrap();
+    if !final_balance_results.is_empty() {
+        let file = File::create(&balance_output_path)?;
+        let mut writer = BufWriter::new(file);
+        
+        for result in final_balance_results.iter() {
+            writeln!(writer, "{}", result.format())?;
+        }
+        
+        writer.flush()?;
+        log::info!("Balance matches written to {:?}", balance_output_path);
+    }
+    
+    Ok(())
+}
+
+/// Result from iterate known wallets scan
+#[derive(Clone)]
+struct IterateMatchResult {
+    original_passphrase: String,
+    original_privkey_hex: String,
+    iteration: u32,
+    derived_privkey: [u8; 32],
+    derived_pubkey: [u8; 33],
+    derived_hash160: [u8; 20],
+    addresses: BitcoinAddresses,
+    db_record: Option<PubkeyRecord>,
+    balances: Option<AllBalances>,
+}
+
+impl IterateMatchResult {
+    fn format(&self) -> String {
+        let mut output = String::new();
+        
+        output.push_str("=== ITERATE MATCH FOUND ===\n");
+        output.push_str(&format!("Original Passphrase: {}\n", self.original_passphrase));
+        output.push_str(&format!("Original Private Key: {}\n", self.original_privkey_hex));
+        output.push_str(&format!("Derivation: SHA256^{}(original_privkey)\n", self.iteration));
+        output.push_str(&format!("Derived Private Key (hex): {}\n", hex::encode(self.derived_privkey)));
+        output.push_str(&format!("Derived Private Key (WIF): {}\n", private_key_to_wif(&self.derived_privkey)));
+        output.push_str(&format!("Public Key: {}\n", hex::encode(self.derived_pubkey)));
+        output.push_str(&format!("HASH160: {}\n", hex::encode(self.derived_hash160)));
+        output.push_str("\nAddresses:\n");
+        output.push_str(&format!("  P2PKH (Legacy):       {}\n", self.addresses.p2pkh));
+        output.push_str(&format!("  P2WPKH (SegWit):      {}\n", self.addresses.p2wpkh));
+        output.push_str(&format!("  P2SH-P2WPKH (Nested): {}\n", self.addresses.p2sh_p2wpkh));
+        
+        if let Some(ref record) = self.db_record {
+            output.push_str(&format!("\nFirst Seen Height: {}\n", record.first_seen_height));
+            output.push_str(&format!("Pubkey Type: {:?}\n", record.pubkey_type));
+        }
+        
+        if let Some(ref balances) = self.balances {
+            output.push_str(&format!("\nBalances:\n{}\n", balances.format()));
+        }
+        
+        output.push_str("===========================\n");
+        
+        output
+    }
 }
 
 fn main() -> Result<()> {
@@ -2140,6 +3336,62 @@ fn main() -> Result<()> {
         }
         Commands::Export { database, output, format } => {
             run_export(database, output, format)?;
+        }
+        Commands::Genesis {
+            data_dir,
+            output,
+            seed,
+            numeric_digits,
+            numeric_mode,
+            meaningful_numbers,
+            skip_bloom,
+            electrs,
+            known_db,
+            no_known_db,
+            threads,
+            try_hex_encoding,
+            try_reversed,
+            all_seeds,
+        } => {
+            run_genesis(
+                data_dir,
+                output,
+                seed,
+                numeric_digits,
+                numeric_mode,
+                meaningful_numbers,
+                skip_bloom,
+                electrs,
+                known_db,
+                no_known_db,
+                threads,
+                try_hex_encoding,
+                try_reversed,
+                all_seeds,
+            )?;
+        }
+        Commands::IterateKnown {
+            data_dir,
+            output,
+            known_db,
+            max_iterations,
+            skip_bloom,
+            electrs,
+            balance_output,
+            threads,
+            balance_only,
+        } => {
+            run_iterate_known(
+                data_dir,
+                output,
+                known_db,
+                max_iterations,
+                skip_bloom,
+                electrs,
+                balance_output,
+                threads,
+                balance_only,
+            )?;
         }
     }
 

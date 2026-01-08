@@ -386,3 +386,87 @@ brain-wallet scan \
 
 这样可以快速判断找到的匹配是否有可用余额。
 
+
+
+## 宸茬煡鑴戦挶鍖呰凯浠ｅ搱甯屾壂鎻?(IterateKnown Mode)
+
+杩欐槸涓€涓宸茬煡鑴戦挶鍖呰繘琛屾繁搴︽寲鎺樼殑妯″紡銆傚畠浼氳鍙栧凡鐭ョ殑鑴戦挶鍖呮暟鎹簱锛屽姣忎釜閽卞寘鐨勭閽ヨ繘琛屽娆?SHA256 鍝堝笇锛? 鍒?N 娆★級锛屾瘡娆″搱甯屽悗閮芥鏌ュ搴旂殑鍏挜鏄惁鍦ㄦ暟鎹簱涓紝骞跺彲閫夊湴鏌ヨ浣欓銆?
+### 鍘熺悊
+
+鏌愪簺鏃╂湡鐨勬瘮鐗瑰竵鐢ㄦ埛鍙兘浼氬湪鍘熷鑴戦挶鍖呯閽ョ殑鍩虹涓婂啀杩涜棰濆鐨勫搱甯屾搷浣滄潵澧炲己瀹夊叏鎬э紝渚嬪锛?
+- 瀵圭閽ュ仛 1000 娆?SHA256
+- 浣跨敤 PBKDF2 鎴栫被浼肩殑杩唬鍝堝笇鏂规
+
+杩欎釜妯″紡鍙互鍙戠幇杩欎簺娲剧敓閽卞寘銆?
+### 浣跨敤鏂规硶
+
+**鍩虹鐢ㄦ硶锛?*
+
+\\ash
+# 瀵瑰凡鐭ヨ剳閽卞寘杩涜 1000 娆?SHA256 杩唬锛屾瘡娆￠兘鏌ヨ鏁版嵁搴?brain-wallet iterate-known --max-iterations 1000
+\
+**甯︿綑棰濇煡璇細**
+
+\\ash
+# 鍚屾椂鏌ヨ姣忔杩唬鐨勪綑棰?brain-wallet iterate-known --max-iterations 1000 --electrs 192.168.1.19:50001
+\
+**浠呮煡璇綑棰濓紙涓嶆鏌ユ暟鎹簱锛夛細**
+
+\\ash
+# 璺宠繃鏁版嵁搴撴鏌ワ紝鍙煡璇綑棰?brain-wallet iterate-known --max-iterations 500 --electrs 192.168.1.19:50001 --balance-only
+\
+**瀹屾暣鍙傛暟锛?*
+
+\\ash
+brain-wallet iterate-known \
+  --known-db known_brainwallets.jsonl \
+  --data-dir output \
+  --output iterate_matches.txt \
+  --balance-output iterate_matches_with_balance.txt \
+  --max-iterations 1000 \
+  --electrs 192.168.1.19:50001 \
+  --threads 8
+\
+### 鍙傛暟璇存槑
+
+| 鍙傛暟 | 璇存槑 | 榛樿鍊?|
+|------|------|--------|
+| \--known-db\ | 宸茬煡鑴戦挶鍖呮暟鎹簱璺緞 | \known_brainwallets.jsonl\ |
+| \--data-dir\ | 鍏挜鏁版嵁搴撶洰褰?| \output\ |
+| \--output\ | 鏁版嵁搴撳尮閰嶇粨鏋滆緭鍑烘枃浠?| \iterate_matches.txt\ |
+| \--balance-output\ | 鏈変綑棰濈殑鍖归厤缁撴灉杈撳嚭鏂囦欢 | \iterate_matches_with_balance.txt\ |
+| \--max-iterations\ | 鏈€澶?SHA256 杩唬娆℃暟 | @0\ |
+| \--electrs\ | Electrs 鏈嶅姟鍣ㄥ湴鍧€ | (鏃? |
+| \--threads\ | 绾跨▼鏁?| (鎵€鏈?CPU) |
+| \--skip-bloom\ | 璺宠繃 Bloom Filter | \alse\ |
+| \--balance-only\ | 浠呮煡璇綑棰濓紝璺宠繃鏁版嵁搴撴鏌?| \alse\ |
+
+### 宸ヤ綔閲忎及绠?
+- 鍋囪鏈?100 涓凡鐭ヨ剳閽卞寘
+- 璁剧疆 1000 娆¤凯浠?- 鎬诲叡妫€鏌ワ細100 x 1000 = 100,000 涓€欓€?
+### 鍖归厤缁撴灉绀轰緥
+
+\=== ITERATE MATCH FOUND ===
+Original Passphrase: password
+Original Private Key: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8
+Derivation: SHA256^42(original_privkey)
+Derived Private Key (hex): a1b2c3d4...
+Derived Private Key (WIF): 5Kb8kL...
+Public Key: 03abc123...
+HASH160: def456...
+
+Addresses:
+  P2PKH (Legacy):       1ABC...
+  P2WPKH (SegWit):      bc1q...
+  P2SH-P2WPKH (Nested): 3XYZ...
+
+First Seen Height: 12345
+Pubkey Type: Legacy
+
+Balances:
+    P2PKH:       0.00012345 BTC (confirmed: 12345, unconfirmed: 0)
+    P2WPKH:      0 BTC (confirmed: 0, unconfirmed: 0)
+    P2SH-P2WPKH: 0 BTC (confirmed: 0, unconfirmed: 0)
+    TOTAL:       0.00012345 BTC
+===========================
+\

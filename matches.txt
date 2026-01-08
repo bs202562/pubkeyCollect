@@ -1,22 +1,15 @@
 === MATCH FOUND ===
-Passphrase: dupa
-Hash Derivation: sha256^1000(passphrase)
-Private Key (hex): dc48b660c516525c7e6f0dbe94c482977521ce422152d2a0c3323b8d2b054dc5
-Private Key (WIF): L4buyov71LjVhBkp9bmZj8TNqZA9m5J7BVnvX7xiHSTyVAnKEg7b
-Public Key: 02e6fd6cdf0b5c070a9d6d59a330459862a77d24c686c103e3003cc0ea87de597f
-HASH160: cdf5e5840a5c3c1171daf21b11513c946e9e7064
+Passphrase: genesis:merkle:hex_str:num[0001]
+Private Key (hex): f6474251af98c390de6f8edb3fc7efd1a899e45bd63ecc764c28de6f21bba2cf
+Private Key (WIF): L5UShGkcaWLrbmGjSdDwotsqgnWE4EjH77ED1LyXHvUcY6ipCt7w
+Public Key: 03b091de81774afb0d1a517c0bdf642c8e7ee4af7d6fc4e72b896adc8aad79b120
+HASH160: 894432bf5a9ae9696e4fdb235270096a8466b181
 
 Addresses:
-P2PKH (Legacy):      1Kn26WySW9bFVku8JuvKTzvCUuPHTPvyNp
-P2WPKH (SegWit):     bc1qeh67tpq2ts7pzuw67gd3z5fuj3hfuurytkwyha
-P2SH-P2WPKH (Nested):39wj2kFjt7YA4YwqmKZWtGuszrWxjMBJSk
-
-Balances:
-    P2PKH:       0 BTC (confirmed: 0, unconfirmed: 0)
-    P2WPKH:      0 BTC (confirmed: 0, unconfirmed: 0)
-    P2SH-P2WPKH: 0 BTC (confirmed: 0, unconfirmed: 0)
-    TOTAL:       0 BTC
-First Seen Height: 514780
+P2PKH (Legacy):      1DWoGn4u9ec8ciaUcdCXkJS2JgYe12x35i
+P2WPKH (SegWit):     bc1q39zr9066nt5kjmj0mv34yuqfd2zxdvvpjxv7hs
+P2SH-P2WPKH (Nested):3GLoCPKs12WNS5G1rQpZ3VQ79kouCTK6aJ
+First Seen Height: 389583
 Pubkey Type: Legacy
 ==================
 
